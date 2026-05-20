@@ -49,9 +49,10 @@ export class InfrastructureStack extends cdk.Stack {
     //Lambda Security Group.
 
     //in and outbound rules for the security groups. 
-    albSg.addEgressRule(ec2.Peer.securityGroupId(ecsSg.securityGroupId), ec2.Port.tcp(3000))
-    albSg.addEgressRule(ec2.Peer.securityGroupId(ecsSg.securityGroupId), ec2.Port.tcp(8429))
-    ecsSg.addIngressRule(ec2.Peer.securityGroupId(albSg.securityGroupId), ec2.Port.tcp(3000))
-    ecsSg.addIngressRule(ec2.Peer.securityGroupId(albSg.securityGroupId), ec2.Port.tcp(8429))
+    albSg.addEgressRule(ecsSg, ec2.Port.tcp(3000))
+    albSg.addEgressRule(ecsSg, ec2.Port.tcp(8429))
+    ecsSg.addIngressRule(albSg, ec2.Port.tcp(3000))
+    ecsSg.addIngressRule(albSg, ec2.Port.tcp(8429))
+
   }
 }
