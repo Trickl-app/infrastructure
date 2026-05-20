@@ -27,5 +27,31 @@ export class InfrastructureStack extends cdk.Stack {
         },
       ],
     });
+
+    // should allow no outbound traffic, but allow the VPC
+    const albSg = new ec2.SecurityGroup(this, 'ALBSg', {
+      // ties the SG to the VPC. Just shows it where to live, assigned to nothing as yet. 
+      vpc, 
+      description: "Security group for Application Load Balancer",
+      allowAllOutbound: false,
+    });
+
+    const ecsSg = new ec2.SecurityGroup(this, 'ECSSg', {
+      vpc,
+      description: "Security group for ECS cluster",
+      allowAllOutbound: false,
+    });
+
+    //RDS security group. 
+    // inbound on port 5432
+    // ourbound on 5432
+
+    //Lambda Security Group.
+
+    //in and outbound rules for the security groups. 
+    albSg.addEgressRule(ec2.Peer.securityGroupId(ecsSg.securityGroupId), ec2.Port.tcp(3000))
+    albSg.addEgressRule(ec2.Peer.securityGroupId(ecsSg.securityGroupId), ec2.Port.tcp(8429))
+    ecsSg.addIngressRule(ec2.Peer.securityGroupId(albSg.securityGroupId), ec2.Port.tcp(3000))
+    ecsSg.addIngressRule(ec2.Peer.securityGroupId(albSg.securityGroupId), ec2.Port.tcp(8429))
   }
 }
