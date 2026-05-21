@@ -44,6 +44,7 @@ export class ApplicationStack extends cdk.Stack {
     const asg = cluster.addCapacity('MetropolisASG', {
       instanceType: ec2.InstanceType.of(ec2.InstanceClass.T3, ec2.InstanceSize.MEDIUM),
       desiredCapacity: 1,
+      maxCapacity: 3,
       vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
     });
     asg.addSecurityGroup(props.ecsSg);
