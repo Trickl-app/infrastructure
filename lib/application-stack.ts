@@ -4,6 +4,7 @@ import * as ecs from 'aws-cdk-lib/aws-ecs';
 import * as ecr from 'aws-cdk-lib/aws-ecr';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as logs from 'aws-cdk-lib/aws-logs';
+import * as elbv2 from 'aws-cdk-lib/aws-elasticloadbalancingv2';
 import { Construct } from 'constructs';
 
 // defines the inputs this stack requires from NetworkStack.
@@ -165,9 +166,83 @@ export class ApplicationStack extends cdk.Stack {
 
     // ── ECS Services ──────────────────────────────────────────────────────────
     // one per container, each linked to the cluster and task definition
+    const vmAgentService = new ecs.Ec2Service(this, 'VmAgentService', {
+      cluster: cluster,
+      taskDefinition: vmAgentTaskDef,
+      desiredCount: 1,
+    });
+    
+    // won't be used again so no need to store
+    new ecs.Ec2Service(this, 'VmInsertService', {
+      cluster: cluster,
+      taskDefinition: vmInsertTaskDef,
+      desiredCount: 1,
+    });
+
+    // same as above
+    new ecs.Ec2Service(this, 'VmSelectService', {
+      cluster: cluster,
+      taskDefinition: vmSelectTaskDef,
+      desiredCount: 1,
+    });
+    
+    //again same
+    new ecs.Ec2Service(this, 'VmStorageService', {
+      cluster: cluster,
+      taskDefinition: vmStorageTaskDef,
+      desiredCount: 1,
+      // mhp is to ensure that two storage tasks can never be concurrently running.
+      maxHealthyPercent: 100,
+      minHealthyPercent: 0
+    })
+
+    const grafanaService = new ecs.Ec2Service(this, 'GrafanaService', {
+      cluster: cluster,
+      taskDefinition: grafanaTaskDef,
+      desiredCount: 1,
+    });
 
     // ── Application Load Balancer ─────────────────────────────────────────────
     // sits in the public subnet, listeners on port 8429 (telemetry) and 3000 (Grafana)
+    const alb = new elbv2.ApplicationLoadBalancer(this, 'MetropolisALB', {
+      vpc: props.vpc,
+      internetFacing: true,
+      securityGroup: props.albSg,
+      vpcSubnets: { subnetType: ec2.SubnetType.PUBLIC },
+    });
+
+    // open: false — albSg already defines inbound rules, prevents CDK adding a duplicate 0.0.0.0/0 ingress.
+    const telemetryListener = alb.addListener('TelemetryListener', {
+      port: 8429,
+      open: false,
+    });
+    telemetryListener.addTargets('VmAgentTarget', {
+      port: 8429,
+      targets: [vmAgentService.loadBalancerTarget({
+        containerName: 'VmAgentContainer',
+        containerPort: 8429,
+      })],
+      healthCheck: {
+        path: '/health',
+        interval: cdk.Duration.seconds(30),
+      },
+    });
+
+    const grafanaListener = alb.addListener('GrafanaListener', {
+      port: 3000,
+      open: false,
+    });
+    grafanaListener.addTargets('GrafanaTarget', {
+      port: 3000,
+      targets: [grafanaService.loadBalancerTarget({
+        containerName: 'GrafanaContainer',
+        containerPort: 3000,
+      })],
+      healthCheck: {
+        path: '/api/health',
+        interval: cdk.Duration.seconds(30),
+      },
+    });
 
     // ── Lambda + EventBridge ──────────────────────────────────────────────────
     // Lambda reads from VM and Grafana endpoints every 24hrs and writes to RDS
