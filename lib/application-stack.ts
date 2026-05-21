@@ -50,7 +50,7 @@ export class ApplicationStack extends cdk.Stack {
 
     // ── IAM Roles ─────────────────────────────────────────────────────────────
 
-    // role to ensure ECS can write output logs to cloudwatch
+    // role to ensure ECS can write output logs to cloudwatch and pull container Images from ECS
     const taskExecutionRole = new iam.Role(this, 'TaskExecutionRole', {
       // assumedBy tells AWS that ECS (not a user) is the one using this role.
       assumedBy: new iam.ServicePrincipal('ecs-tasks.amazonaws.com'),
@@ -58,6 +58,22 @@ export class ApplicationStack extends cdk.Stack {
         iam.ManagedPolicy.fromAwsManagedPolicyName('service-role/AmazonECSTaskExecutionRolePolicy'),
       ],
     });
+
+    //role for ASG to register EC2 instances with ECS cluster
+    const ec2InstanceRole = new iam.Role(this, 'Ec2InstanceRole', {
+      assumedBy: new iam.ServicePrincipal('ec2.amazonaws.com'),
+      managedPolicies: [
+        iam.ManagedPolicy.fromAwsManagedPolicyName('service-role/AmazonEC2ContainerServiceforEC2Role'),
+      ],
+    });
+
+    // role for Lambda functions to write logs to cloudwatch and to interact with other services in the VPC
+    const lambdaExecutionRole = new iam.Role(this, 'LambdaExecutionRole', {
+      assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
+      managedPolicies: [
+        iam.ManagedPolicy.fromAwsManagedPolicyName('service-role/AWSLambdaVPCAccessExecutionRole')
+      ]
+    })
 
     // ── ECS Task Definitions ──────────────────────────────────────────────────
     // Ec2TaskDefinition is used because we are running on EC2 instances, not Fargate.
