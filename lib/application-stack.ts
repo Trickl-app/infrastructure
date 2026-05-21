@@ -62,6 +62,23 @@ export class ApplicationStack extends cdk.Stack {
     });
     asg.addSecurityGroup(props.ecsSg);
 
+    // resolve the CloudFormation logical ID of the ASG at synth time.
+    // this is needed so the cfn-signal command on the instance knows which
+    // CloudFormation resource to signal when it is ready.
+    const cfnAsg = asg.node.defaultChild as autoscaling.CfnAutoScalingGroup;
+    const asgLogicalId = this.getLogicalId(cfnAsg);
+
+    // set the CreationPolicy directly on the CloudFormation resource rather than
+    // via the CDK 'signals' property — addCapacity() sets updateType internally
+    // which conflicts with 'signals'. both approaches produce the same CloudFormation
+    // output: CloudFormation waits for a signal from the instance before proceeding.
+    cfnAsg.cfnOptions.creationPolicy = {
+      resourceSignal: {
+        count: 1,
+        timeout: 'PT10M',
+      },
+    };
+
     // format the volume on first boot (blkid exits non-zero if unformatted), then mount it.
     // nofail in fstab prevents the instance hanging on boot if the volume is briefly unavailable.
     asg.userData.addCommands(
@@ -69,6 +86,12 @@ export class ApplicationStack extends cdk.Stack {
       'mkdir -p /data/vm-storage',
       'mount /dev/xvdb /data/vm-storage || true',
       "echo '/dev/xvdb /data/vm-storage xfs defaults,nofail 0 2' >> /etc/fstab",
+      // poll the ECS agent's local metadata endpoint every 2 seconds until ClusterARN appears.
+      // ClusterARN being present means the agent has successfully registered with the ECS cluster.
+      'until curl -s http://localhost:51678/v1/metadata | grep -q ClusterARN; do sleep 2; done',
+      // send a success signal to CloudFormation. this is what unblocks the deployment —
+      // CloudFormation will not create the ECS services until this signal is received.
+      `/opt/aws/bin/cfn-signal -e 0 --stack ${this.stackName} --resource ${asgLogicalId} --region ${this.region}`,
     );
 
     // ── IAM Roles ─────────────────────────────────────────────────────────────
@@ -118,7 +141,7 @@ export class ApplicationStack extends cdk.Stack {
         streamPrefix: 'vm-agent',
         logGroup: new logs.LogGroup(this, 'VmAgentLogGroup', {
           logGroupName: '/metropolis/vm-agent',
-          removalPolicy: cdk.RemovalPolicy.DESTROY,
+          removalPolicy: cdk.RemovalPolicy.RETAIN,
         }),
       }),
     });
@@ -136,7 +159,7 @@ export class ApplicationStack extends cdk.Stack {
         streamPrefix: 'vm-insert',
         logGroup: new logs.LogGroup(this, 'VmInsertLogGroup', {
           logGroupName: '/metropolis/vm-insert',
-          removalPolicy: cdk.RemovalPolicy.DESTROY,
+          removalPolicy: cdk.RemovalPolicy.RETAIN,
         }),
       }),
     });
@@ -154,7 +177,7 @@ export class ApplicationStack extends cdk.Stack {
         streamPrefix: 'vm-select',
         logGroup: new logs.LogGroup(this, 'VmSelectLogGroup', {
           logGroupName: '/metropolis/vm-select',
-          removalPolicy: cdk.RemovalPolicy.DESTROY,
+          removalPolicy: cdk.RemovalPolicy.RETAIN,
         }),
       }),
     });
@@ -174,7 +197,7 @@ export class ApplicationStack extends cdk.Stack {
         streamPrefix: 'vm-storage',
         logGroup: new logs.LogGroup(this, 'VmStorageLogGroup', {
           logGroupName: '/metropolis/vm-storage',
-          removalPolicy: cdk.RemovalPolicy.DESTROY,
+          removalPolicy: cdk.RemovalPolicy.RETAIN,
         }),
       }),
     });
@@ -191,13 +214,17 @@ export class ApplicationStack extends cdk.Stack {
         streamPrefix: 'grafana',
         logGroup: new logs.LogGroup(this, 'GrafanaLogGroup', {
           logGroupName: '/metropolis/grafana',
-          removalPolicy: cdk.RemovalPolicy.DESTROY,
+          removalPolicy: cdk.RemovalPolicy.RETAIN,
         }),
       }),
     });
 
     // ── ECS Services ──────────────────────────────────────────────────────────
-    // one per container, each linked to the cluster and task definition
+    // one per container, each linked to the cluster and task definition.
+    // node.addDependency(asg) on every service forces CloudFormation to wait for
+    // the ASG CreationPolicy signal before creating any service. without this,
+    // CloudFormation creates services and the ASG in parallel — tasks fail to
+    // place because the ECS agent hasn't registered yet.
     const vmAgentService = new ecs.Ec2Service(this, 'VmAgentService', {
       cluster: cluster,
       taskDefinition: vmAgentTaskDef,
@@ -205,24 +232,25 @@ export class ApplicationStack extends cdk.Stack {
       minHealthyPercent: 0,
       circuitBreaker: { rollback: true },
     });
+    vmAgentService.node.addDependency(asg);
 
-    new ecs.Ec2Service(this, 'VmInsertService', {
+    const vmInsertService = new ecs.Ec2Service(this, 'VmInsertService', {
       cluster: cluster,
       taskDefinition: vmInsertTaskDef,
       desiredCount: 1,
       minHealthyPercent: 0,
-      circuitBreaker: { rollback: true },
     });
+    vmInsertService.node.addDependency(asg);
 
-    new ecs.Ec2Service(this, 'VmSelectService', {
+    const vmSelectService = new ecs.Ec2Service(this, 'VmSelectService', {
       cluster: cluster,
       taskDefinition: vmSelectTaskDef,
       desiredCount: 1,
       minHealthyPercent: 0,
-      circuitBreaker: { rollback: true },
     });
+    vmSelectService.node.addDependency(asg);
 
-    new ecs.Ec2Service(this, 'VmStorageService', {
+    const vmStorageService = new ecs.Ec2Service(this, 'VmStorageService', {
       cluster: cluster,
       taskDefinition: vmStorageTaskDef,
       desiredCount: 1,
@@ -230,8 +258,8 @@ export class ApplicationStack extends cdk.Stack {
       // prevents two storage tasks writing to the same EBS volume simultaneously.
       maxHealthyPercent: 100,
       minHealthyPercent: 0,
-      circuitBreaker: { rollback: true },
     });
+    vmStorageService.node.addDependency(asg);
 
     const grafanaService = new ecs.Ec2Service(this, 'GrafanaService', {
       cluster: cluster,
@@ -240,6 +268,7 @@ export class ApplicationStack extends cdk.Stack {
       minHealthyPercent: 0,
       circuitBreaker: { rollback: true },
     });
+    grafanaService.node.addDependency(asg);
 
     // ── Application Load Balancer ─────────────────────────────────────────────
     // sits in the public subnet, listeners on port 8429 (telemetry) and 3000 (Grafana)
