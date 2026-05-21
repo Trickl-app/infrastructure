@@ -32,6 +32,5 @@ new ApplicationStack(app, 'ApplicationStack', {
   vpc: network.vpc,
   albSg: network.albSg,
   ecsSg: network.ecsSg,
-  rdsSg: network.rdsSg,
   lambdaSg: network.lambdaSg,
 });
