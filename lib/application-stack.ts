@@ -1,6 +1,9 @@
 import * as cdk from 'aws-cdk-lib/core';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
+import * as ecs from 'aws-cdk-lib/aws-ecs';
 import * as ecr from 'aws-cdk-lib/aws-ecr';
+import * as iam from 'aws-cdk-lib/aws-iam';
+import * as logs from 'aws-cdk-lib/aws-logs';
 import { Construct } from 'constructs';
 
 // defines the inputs this stack requires from NetworkStack.
@@ -29,16 +32,119 @@ export class ApplicationStack extends cdk.Stack {
     // const grafanaRepo = new ecr.Repository(this, 'GrafanaRepository');
 
     // ── ECS Cluster ───────────────────────────────────────────────────────────
-    // logical grouping for all ECS tasks and services
+    // logical grouping for all ECS tasks and services. Tied to the VPC from NetworkStack.
+    const cluster = new ecs.Cluster(this, 'MetropolisCluster', {
+      vpc: props.vpc,
+    });
 
     // ── EC2 Auto Scaling Group ────────────────────────────────────────────────
-    // provides the actual EC2 instances the ECS cluster runs containers on
+    // provides the actual EC2 instances the ECS cluster runs containers on.
+    // instances are placed in the private subnet and use the ECS security group defined in NetworkStack.
+    // addCapacity returns the ASG so we can attach the security group from NetworkStack to it
+    const asg = cluster.addCapacity('MetropolisASG', {
+      instanceType: ec2.InstanceType.of(ec2.InstanceClass.T3, ec2.InstanceSize.MEDIUM),
+      desiredCapacity: 1,
+      vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
+    });
+    asg.addSecurityGroup(props.ecsSg);
 
     // ── IAM Roles ─────────────────────────────────────────────────────────────
-    // ECS task execution role and EC2 instance profile
+
+    // role to ensure ECS can write output logs to cloudwatch
+    const taskExecutionRole = new iam.Role(this, 'TaskExecutionRole', {
+      // assumedBy tells AWS that ECS (not a user) is the one using this role.
+      assumedBy: new iam.ServicePrincipal('ecs-tasks.amazonaws.com'),
+      managedPolicies: [
+        iam.ManagedPolicy.fromAwsManagedPolicyName('service-role/AmazonECSTaskExecutionRolePolicy'),
+      ],
+    });
 
     // ── ECS Task Definitions ──────────────────────────────────────────────────
-    // one per container: VM Agent, VM Insert, VM Select, VM Storage, Grafana
+    // Ec2TaskDefinition is used because we are running on EC2 instances, not Fargate.
+    // executionRole grants ECS permission to write logs to CloudWatch for each task.
+    // addContainer attaches the container spec — image, memory, port, and log destination.
+
+    const vmAgentTaskDef = new ecs.Ec2TaskDefinition(this, 'VmAgentTaskDef', {
+      executionRole: taskExecutionRole,
+    });
+    vmAgentTaskDef.addContainer('VmAgentContainer', {
+      image: ecs.ContainerImage.fromRegistry('victoriametrics/vmagent:latest'),
+      memoryLimitMiB: 512,
+      portMappings: [{ containerPort: 8429 }],
+      logging: ecs.LogDrivers.awsLogs({
+        streamPrefix: 'vm-agent',
+        logGroup: new logs.LogGroup(this, 'VmAgentLogGroup', {
+          logGroupName: '/metropolis/vm-agent',
+          removalPolicy: cdk.RemovalPolicy.DESTROY,
+        }),
+      }),
+    });
+
+    const vmInsertTaskDef = new ecs.Ec2TaskDefinition(this, 'VmInsertTaskDef', {
+      executionRole: taskExecutionRole,
+    });
+    vmInsertTaskDef.addContainer('VmInsertContainer', {
+      image: ecs.ContainerImage.fromRegistry('victoriametrics/vminsert:latest'),
+      memoryLimitMiB: 512,
+      portMappings: [{ containerPort: 8480 }],
+      logging: ecs.LogDrivers.awsLogs({
+        streamPrefix: 'vm-insert',
+        logGroup: new logs.LogGroup(this, 'VmInsertLogGroup', {
+          logGroupName: '/metropolis/vm-insert',
+          removalPolicy: cdk.RemovalPolicy.DESTROY,
+        }),
+      }),
+    });
+
+    const vmSelectTaskDef = new ecs.Ec2TaskDefinition(this, 'VmSelectTaskDef', {
+      executionRole: taskExecutionRole,
+    });
+    vmSelectTaskDef.addContainer('VmSelectContainer', {
+      image: ecs.ContainerImage.fromRegistry('victoriametrics/vmselect:latest'),
+      memoryLimitMiB: 512,
+      portMappings: [{ containerPort: 8481 }],
+      logging: ecs.LogDrivers.awsLogs({
+        streamPrefix: 'vm-select',
+        logGroup: new logs.LogGroup(this, 'VmSelectLogGroup', {
+          logGroupName: '/metropolis/vm-select',
+          removalPolicy: cdk.RemovalPolicy.DESTROY,
+        }),
+      }),
+    });
+
+    // VM Storage needs a volume mount for the EBS volume — handled in the EBS section below.
+    // the container reference is stored so we can call addMountPoints() on it later.
+    const vmStorageTaskDef = new ecs.Ec2TaskDefinition(this, 'VmStorageTaskDef', {
+      executionRole: taskExecutionRole,
+    });
+    const vmStorageContainer = vmStorageTaskDef.addContainer('VmStorageContainer', {
+      image: ecs.ContainerImage.fromRegistry('victoriametrics/victoria-metrics:latest'),
+      memoryLimitMiB: 1024,
+      portMappings: [{ containerPort: 8482 }],
+      logging: ecs.LogDrivers.awsLogs({
+        streamPrefix: 'vm-storage',
+        logGroup: new logs.LogGroup(this, 'VmStorageLogGroup', {
+          logGroupName: '/metropolis/vm-storage',
+          removalPolicy: cdk.RemovalPolicy.DESTROY,
+        }),
+      }),
+    });
+
+    const grafanaTaskDef = new ecs.Ec2TaskDefinition(this, 'GrafanaTaskDef', {
+      executionRole: taskExecutionRole,
+    });
+    grafanaTaskDef.addContainer('GrafanaContainer', {
+      image: ecs.ContainerImage.fromRegistry('grafana/grafana:latest'),
+      memoryLimitMiB: 512,
+      portMappings: [{ containerPort: 3000 }],
+      logging: ecs.LogDrivers.awsLogs({
+        streamPrefix: 'grafana',
+        logGroup: new logs.LogGroup(this, 'GrafanaLogGroup', {
+          logGroupName: '/metropolis/grafana',
+          removalPolicy: cdk.RemovalPolicy.DESTROY,
+        }),
+      }),
+    });
 
     // ── ECS Services ──────────────────────────────────────────────────────────
     // one per container, each linked to the cluster and task definition
