@@ -118,6 +118,15 @@ export class ApplicationStack extends cdk.Stack {
       ],
     });
 
+    // Vector's task role — distinct from the execution role.
+    // The execution role lets ECS pull images and write CloudWatch logs.
+    // The task role is what the running Vector container uses to call AWS APIs,
+    // specifically writing raw metrics to the S3 bucket.
+    const vectorTaskRole = new iam.Role(this, 'VectorTaskRole', {
+      assumedBy: new iam.ServicePrincipal('ecs-tasks.amazonaws.com'),
+    });
+    props.metricsBucket.grantWrite(vectorTaskRole);
+
     //role for ASG to register EC2 instances with ECS cluster
     //EDIT: This is commented out for now because it appears it might not be 
     // needed as an IAM role with the same permissions is auto added. 
@@ -138,13 +147,23 @@ export class ApplicationStack extends cdk.Stack {
       executionRole: taskExecutionRole,
       networkMode: ecs.NetworkMode.HOST,
     });
-    vmAgentTaskDef.addContainer('VmAgentContainer', {
+    vmAgentTaskDef.addVolume({
+      name: "vmagent-config",
+      host: { sourcePath: "/shared/vmagent" }
+    });
+    const VmAgentContainer = vmAgentTaskDef.addContainer('VmAgentContainer', {
       // docker image to pull
       image: ecs.ContainerImage.fromRegistry('victoriametrics/vmagent:latest'),
       // default assumption
       memoryLimitMiB: 512,
       portMappings: [{ containerPort: 8429 }],
-      command: ['-remoteWrite.url=http://localhost:8480/insert/0/prometheus'],
+      command: [
+        '-remoteWrite.url=http://localhost:8480/insert/0/prometheus',
+        "--remoteWrite.streamAggr.config=/etc/vmagent/aggregations.yml",
+        "--remoteWrite.streamAggr.dropInput=true",
+        "--remoteWrite.url=http://localhost:9090/",
+        "--remoteWrite.streamAggr.dropInput=false" 
+      ],
       logging: ecs.LogDrivers.awsLogs({
         streamPrefix: 'vm-agent',
         logGroup: new logs.LogGroup(this, 'VmAgentLogGroup', {
@@ -153,6 +172,12 @@ export class ApplicationStack extends cdk.Stack {
         }),
       }),
     });
+    VmAgentContainer.addMountPoints({
+      containerPath: "/etc/vmagent",
+      sourceVolume: "vmagent-config",
+      readOnly: false
+    })
+
 
     const vmInsertTaskDef = new ecs.Ec2TaskDefinition(this, 'VmInsertTaskDef', {
       executionRole: taskExecutionRole,
@@ -162,7 +187,7 @@ export class ApplicationStack extends cdk.Stack {
       image: ecs.ContainerImage.fromRegistry('victoriametrics/vminsert:latest'),
       memoryLimitMiB: 512,
       portMappings: [{ containerPort: 8480 }],
-      command: ['-storageNode=localhost:8400'],
+      command: ['-storageNode=vmstorage.trickl.local:8400'],
       logging: ecs.LogDrivers.awsLogs({
         streamPrefix: 'vm-insert',
         logGroup: new logs.LogGroup(this, 'VmInsertLogGroup', {
@@ -180,7 +205,7 @@ export class ApplicationStack extends cdk.Stack {
       image: ecs.ContainerImage.fromRegistry('victoriametrics/vmselect:latest'),
       memoryLimitMiB: 512,
       portMappings: [{ containerPort: 8481 }],
-      command: ['-storageNode=localhost:8401'],
+      command: ['-storageNode=vmstorage.trickl.local:8401'],
       logging: ecs.LogDrivers.awsLogs({
         streamPrefix: 'vm-select',
         logGroup: new logs.LogGroup(this, 'VmSelectLogGroup', {
@@ -200,7 +225,11 @@ export class ApplicationStack extends cdk.Stack {
       image: ecs.ContainerImage.fromRegistry('victoriametrics/vmstorage:latest'),
       // larger memory allocation as its a larger process so I am told. 
       memoryLimitMiB: 1024,
-      portMappings: [{ containerPort: 8482 }],
+      portMappings: [
+        { containerPort: 8482 }, // HTTP API (health, metrics, UI)
+        { containerPort: 8400 }, // vminsert write protocol
+        { containerPort: 8401 }, // vmselect read protocol
+      ],
       command: ['-storageDataPath=/victoria-metrics-data'],
       logging: ecs.LogDrivers.awsLogs({
         streamPrefix: 'vm-storage',
@@ -228,6 +257,80 @@ export class ApplicationStack extends cdk.Stack {
         }),
       }),
     });
+
+    // vector task definition
+    const vectorTaskDef = new ecs.Ec2TaskDefinition(this, "VectorTaskDef", {
+      executionRole: taskExecutionRole,
+      taskRole: vectorTaskRole,
+      networkMode: ecs.NetworkMode.HOST
+    });
+    vectorTaskDef.addVolume({
+      name: "vector-toml",
+      host: { sourcePath: "/etc/vector" }
+    });
+    const vectorContainer = vectorTaskDef.addContainer("VectorContainer", {
+      image: ecs.ContainerImage.fromRegistry("timberio/vector:latest"),
+      memoryLimitMiB: 512,
+      portMappings: [{ containerPort: 9090 }],
+      // tell vector where to find its config file (mounted from the host volume below)
+      command: ['--config', '/etc/vector/vector.toml'],
+      logging: ecs.LogDrivers.awsLogs({
+        streamPrefix: 'vector',
+        logGroup: new logs.LogGroup(this, 'VectorLogGroup', {
+          logGroupName: '/metropolis/vector',
+          removalPolicy: cdk.RemovalPolicy.DESTROY,
+        }),
+      }),
+    });
+    vectorContainer.addMountPoints({
+      containerPath: "/etc/vector",
+      sourceVolume: "vector-toml",
+      readOnly: true
+    })
+
+    // ── Smart Metrics (scheduled reader) ─────────────────────────────────────
+    // Placeholder task that runs on a 24h schedule via EventBridge.
+    // Reads from vmselect and Grafana, writes aggregations.yaml to the shared
+    // host volume, then triggers vmagent to reload its config.
+    // Replace the image with the real smart-metrics image when ready.
+    const smartMetricsTaskDef = new ecs.Ec2TaskDefinition(this, 'SmartMetricsTaskDef', {
+      executionRole: taskExecutionRole,
+      networkMode: ecs.NetworkMode.HOST,
+    });
+    smartMetricsTaskDef.addVolume({
+      name: 'vmagent-config',
+      host: { sourcePath: '/shared/vmagent' },
+    });
+    const smartMetricsContainer = smartMetricsTaskDef.addContainer('SmartMetricsContainer', {
+      // placeholder — swap for the real smart-metrics image when implemented
+      image: ecs.ContainerImage.fromRegistry('alpine:latest'),
+      memoryLimitMiB: 256,
+      command: ['echo', 'smart-metrics placeholder'],
+      logging: ecs.LogDrivers.awsLogs({
+        streamPrefix: 'smart-metrics',
+        logGroup: new logs.LogGroup(this, 'SmartMetricsLogGroup', {
+          logGroupName: '/metropolis/smart-metrics',
+          removalPolicy: cdk.RemovalPolicy.DESTROY,
+        }),
+      }),
+    });
+    smartMetricsContainer.addMountPoints({
+      containerPath: '/mnt/vmagent',
+      sourceVolume: 'vmagent-config',
+      readOnly: false,
+    });
+
+    // EventBridge triggers smart-metrics every 24 hours as a one-shot ECS task.
+    // It runs on the interface node so it shares the /shared/vmagent host volume with vmagent.
+    const smartMetricsSchedule = new events.Rule(this, 'SmartMetricsSchedule', {
+      schedule: events.Schedule.rate(cdk.Duration.hours(24)),
+    });
+    smartMetricsSchedule.addTarget(new targets.EcsTask({
+      cluster: cluster,
+      taskDefinition: smartMetricsTaskDef,
+      subnetSelection: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
+      securityGroups: [props.ecsSg],
+    }));
 
     // ── ECS Services ──────────────────────────────────────────────────────────
     // one per container, each linked to the cluster and task definition.
@@ -340,25 +443,25 @@ export class ApplicationStack extends cdk.Stack {
       },
     });
 
-    // ── Lambda + EventBridge ──────────────────────────────────────────────────
-    // Lambda reads from VM and Grafana endpoints every 24hrs and writes to RDS
-    // EventBridge triggers the Lambda on a cron schedule
-    const metricsReader = new lambda.Function(this, 'MetricsReaderFunction', {
-      runtime: lambda.Runtime.NODEJS_22_X,
-      handler: 'index.handler',
-      // placeholder:real implementation reads from VM/Grafana and writes to RDS
-      code: lambda.Code.fromInline('exports.handler = async () => {};'),
-      role: lambdaExecutionRole,
-      vpc: props.vpc,
-      securityGroups: [props.lambdaSg],
-      vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
-      timeout: cdk.Duration.minutes(5),
-    });
+    // // ── Lambda + EventBridge ──────────────────────────────────────────────────
+    // // Lambda reads from VM and Grafana endpoints every 24hrs and writes to RDS
+    // // EventBridge triggers the Lambda on a cron schedule
+    // const metricsReader = new lambda.Function(this, 'MetricsReaderFunction', {
+    //   runtime: lambda.Runtime.NODEJS_22_X,
+    //   handler: 'index.handler',
+    //   // placeholder:real implementation reads from VM/Grafana and writes to RDS
+    //   code: lambda.Code.fromInline('exports.handler = async () => {};'),
+    //   role: lambdaExecutionRole,
+    //   vpc: props.vpc,
+    //   securityGroups: [props.lambdaSg],
+    //   vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
+    //   timeout: cdk.Duration.minutes(5),
+    // });
 
-    const metricsSchedule = new events.Rule(this, 'MetricsReaderSchedule', {
-      schedule: events.Schedule.rate(cdk.Duration.hours(24)),
-    });
-    metricsSchedule.addTarget(new targets.LambdaFunction(metricsReader));
+    // const metricsSchedule = new events.Rule(this, 'MetricsReaderSchedule', {
+    //   schedule: events.Schedule.rate(cdk.Duration.hours(24)),
+    // });
+    // metricsSchedule.addTarget(new targets.LambdaFunction(metricsReader));
 
     // ── EBS Volume ────────────────────────────────────────────────────────────
     // attached to the EC2 instance, mounted by VM Storage for persistent data

@@ -1,6 +1,7 @@
 import * as cdk from 'aws-cdk-lib/core';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as rds from 'aws-cdk-lib/aws-rds';
+import * as s3 from 'aws-cdk-lib/aws-s3';
 import { Construct } from 'constructs';
 
 // defines what this stack needs from other stacks
@@ -12,9 +13,18 @@ interface DataStackProps extends cdk.StackProps {
 
 export class DataStack extends cdk.Stack {
   public readonly rdsEndpoint: string;
+  public readonly metricsBucket: s3.Bucket;
 
   constructor(scope: Construct, id: string, props: DataStackProps) {
     super(scope, id, props);
+
+    // S3 bucket for raw metrics archive written by Vector.
+    // RETAIN ensures the bucket and its data survive stack teardowns.
+    this.metricsBucket = new s3.Bucket(this, 'MetricsBucket', {
+      encryption: s3.BucketEncryption.S3_MANAGED,
+      blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
+    });
 
     // new rds instance
     const db = new rds.DatabaseInstance(this, 'Database', {

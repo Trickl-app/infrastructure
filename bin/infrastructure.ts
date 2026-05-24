@@ -32,5 +32,5 @@ new ApplicationStack(app, 'ApplicationStack', {
   vpc: network.vpc,
   albSg: network.albSg,
   ecsSg: network.ecsSg,
-  lambdaSg: network.lambdaSg,
+  metricsBucket: data.metricsBucket,
 });
