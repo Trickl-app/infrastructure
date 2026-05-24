@@ -9,7 +9,6 @@ export class NetworkStack extends cdk.Stack {
   public readonly albSg: ec2.SecurityGroup;
   public readonly ecsSg: ec2.SecurityGroup;
   public readonly rdsSg: ec2.SecurityGroup;
-  public readonly lambdaSg: ec2.SecurityGroup;
 
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, props);
@@ -60,14 +59,6 @@ export class NetworkStack extends cdk.Stack {
       allowAllOutbound: false,
     });
 
-    // Lambda sits in the private subnet (VPC-attached). It reads from VM and Grafana endpoints every 24hrs
-    // and writes results to RDS. No inbound needed — Lambda always initiates.
-    this.lambdaSg = new ec2.SecurityGroup(this, 'LambdaSg', {
-      vpc: this.vpc,
-      description: "Security group for Lambda scheduled reader",
-      allowAllOutbound: false,
-    });
-
     // --------------- LOAD BALANCER RULES ---------------- //
 
     // Allow inbound telemetry data from the internet to reach the ALB.
@@ -102,20 +93,5 @@ export class NetworkStack extends cdk.Stack {
 
     // Allow Lambda to write recommendations to Postgres.
     this.rdsSg.addIngressRule(this.lambdaSg, ec2.Port.tcp(5432));
-
-    // --------------- LAMBDA RULES ---------------- //
-
-    // Lambda -> vmagent (8429)
-    this.lambdaSg.addEgressRule(this.ecsSg, ec2.Port.tcp(8429));
-    // Lambda -> Grafana (3000)
-    this.lambdaSg.addEgressRule(this.ecsSg, ec2.Port.tcp(3000));
-    // Lambda -> vmselect (8481)
-    this.lambdaSg.addEgressRule(this.ecsSg, ec2.Port.tcp(8481));
-    // Lambda -> RDS Postgres (5432)
-    this.lambdaSg.addEgressRule(this.rdsSg, ec2.Port.tcp(5432));
-    // Lambda -> CloudWatch / STS (443)
-    this.lambdaSg.addEgressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(443));
-    // Lambda -> VPC DNS resolver (53)
-    this.lambdaSg.addEgressRule(ec2.Peer.anyIpv4(), ec2.Port.udp(53));
   }
 }
