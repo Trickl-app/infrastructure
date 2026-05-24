@@ -6,7 +6,8 @@ import * as iam from 'aws-cdk-lib/aws-iam';
 import * as logs from 'aws-cdk-lib/aws-logs';
 import * as elbv2 from 'aws-cdk-lib/aws-elasticloadbalancingv2';
 import * as autoscaling from 'aws-cdk-lib/aws-autoscaling';
-import * as lambda from 'aws-cdk-lib/aws-lambda';
+import * as s3 from 'aws-cdk-lib/aws-s3';
+import * as serviceDiscover from 'aws-cdk-lib/aws-servicediscovery';
 import * as events from 'aws-cdk-lib/aws-events';
 import * as targets from 'aws-cdk-lib/aws-events-targets';
 import { Construct } from 'constructs';
@@ -29,7 +30,7 @@ interface ApplicationStackProps extends cdk.StackProps {
   vpc: ec2.IVpc;
   albSg: ec2.ISecurityGroup;
   ecsSg: ec2.ISecurityGroup;
-  lambdaSg: ec2.ISecurityGroup;
+  metricsBucket: s3.IBucket;
 }
 
 export class ApplicationStack extends cdk.Stack {
@@ -56,11 +57,27 @@ export class ApplicationStack extends cdk.Stack {
     // ── EC2 Auto Scaling Group ────────────────────────────────────────────────
     // provides the actual EC2 instances. Made assumptions about the size we would need. 
     // instances are placed in the private subnet and use the ECS security group defined in NetworkStack.
-    const asg = cluster.addCapacity('MetropolisASG', {
+  
+    const interfaceASG = cluster.addCapacity("InterfaceASG", {
+      instanceType: ec2.InstanceType.of(ec2.InstanceClass.T3, ec2.InstanceSize.MEDIUM),
+      desiredCapacity:1,
+      maxCapacity: 1,
+      vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS }
+    });
+    interfaceASG.addSecurityGroup(props.ecsSg);
+
+    const selectASG = cluster.addCapacity("vmselectASG", {
+      instanceType: ec2.InstanceType.of(ec2.InstanceClass.T3, ec2.InstanceSize.SMALL),
+      desiredCapacity: 1,
+      maxCapacity: 1,
+      vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS }
+    });
+    selectASG.addSecurityGroup(props.ecsSg);
+
+    const storageASG = cluster.addCapacity("vmstorageASG", {
       instanceType: ec2.InstanceType.of(ec2.InstanceClass.T3, ec2.InstanceSize.MEDIUM),
       desiredCapacity: 1,
       maxCapacity: 1,
-      // pinning to a specific AZ, which is required to use EBS. 
       vpcSubnets: { subnets: [props.vpc.privateSubnets[0]] },
       blockDevices: [{
         deviceName: '/dev/xvdb',
@@ -69,11 +86,11 @@ export class ApplicationStack extends cdk.Stack {
           deleteOnTermination: false,
         }),
       }],
-    });
-    asg.addSecurityGroup(props.ecsSg);
+    })
+    storageASG.addSecurityGroup(props.ecsSg);
 
     // config for the EBS volume. My understanding is weak here, but they are all essential. 
-    asg.userData.addCommands(
+    storageASG.userData.addCommands(
       // formats the disk with a file system. 
       'blkid /dev/xvdb || mkfs -t xfs /dev/xvdb',
       // cretes the folder the disk will be accessible through.
