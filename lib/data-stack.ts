@@ -2,6 +2,7 @@ import * as cdk from 'aws-cdk-lib/core';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as rds from 'aws-cdk-lib/aws-rds';
 import * as s3 from 'aws-cdk-lib/aws-s3';
+import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import { Construct } from 'constructs';
 
 // defines what this stack needs from other stacks
@@ -14,6 +15,7 @@ interface DataStackProps extends cdk.StackProps {
 export class DataStack extends cdk.Stack {
   public readonly rdsEndpoint: string;
   public readonly metricsBucket: s3.Bucket;
+  public readonly dbSecret: secretsmanager.ISecret;
 
   constructor(scope: Construct, id: string, props: DataStackProps) {
     super(scope, id, props);
@@ -33,18 +35,21 @@ export class DataStack extends cdk.Stack {
       }),
       vpc: props.vpc,
       vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
-      
-      //assigns passed in security group from NetworkStack to the 
-      // RDS instance, which only allows inbound on port 5432 from 
-      // the ECS and Lambda SGs. No outbound rules needed for RDS.
       securityGroups: [props.rdsSg],
       instanceType: ec2.InstanceType.of(ec2.InstanceClass.T3, ec2.InstanceSize.MICRO),
       multiAz: false,
       allocatedStorage: 20,
       deletionProtection: true,
+      // auto-generates a username/password and stores them in Secrets Manager.
+      // smart-metrics reads DB_USER and DB_PASSWORD from the secret at runtime.
+      credentials: rds.Credentials.fromGeneratedSecret('metropolis'),
+      // explicit db name so smart-metrics can reference it as a known constant.
+      databaseName: 'metropolis',
     });
 
-    // rds endpoint property made public
+    // rds endpoint and secret made public for ApplicationStack to consume
     this.rdsEndpoint = db.instanceEndpoint.hostname;
+    // db.secret is always defined when using fromGeneratedSecret
+    this.dbSecret = db.secret!;
   }
 }

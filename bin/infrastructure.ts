@@ -33,4 +33,6 @@ new ApplicationStack(app, 'ApplicationStack', {
   albSg: network.albSg,
   ecsSg: network.ecsSg,
   metricsBucket: data.metricsBucket,
+  rdsEndpoint: data.rdsEndpoint,
+  dbSecret: data.dbSecret,
 });

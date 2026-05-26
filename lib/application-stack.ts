@@ -8,6 +8,7 @@ import * as elbv2 from 'aws-cdk-lib/aws-elasticloadbalancingv2';
 import * as autoscaling from 'aws-cdk-lib/aws-autoscaling';
 import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as serviceDiscovery from 'aws-cdk-lib/aws-servicediscovery';
+import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import { Construct } from 'constructs';
 
 // ------- COMPONENTS AND DESCRIPTIONS --------- //
@@ -29,6 +30,8 @@ interface ApplicationStackProps extends cdk.StackProps {
   albSg: ec2.ISecurityGroup;
   ecsSg: ec2.ISecurityGroup;
   metricsBucket: s3.IBucket;
+  rdsEndpoint: string;
+  dbSecret: secretsmanager.ISecret;
 }
 
 export class ApplicationStack extends cdk.Stack {
