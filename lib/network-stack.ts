@@ -76,6 +76,10 @@ export class NetworkStack extends cdk.Stack {
     this.albSg.addEgressRule(this.ecsSg, ec2.Port.tcp(8429));
     // Allow the ALB to forward Grafana traffic onwards to the Grafana ECS container.
     this.albSg.addEgressRule(this.ecsSg, ec2.Port.tcp(3000));
+    // Allow inbound smart-metrics API traffic from the internet to reach the ALB.
+    this.albSg.addIngressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(3001));
+    // Allow the ALB to forward smart-metrics API traffic to the smart-metrics container.
+    this.albSg.addEgressRule(this.ecsSg, ec2.Port.tcp(3001));
 
     // --------------- ECS RULES ---------------- //
 
@@ -83,6 +87,8 @@ export class NetworkStack extends cdk.Stack {
     this.ecsSg.addIngressRule(this.albSg, ec2.Port.tcp(8429));
     // Allow Grafana to receive dashboard traffic forwarded by the ALB.
     this.ecsSg.addIngressRule(this.albSg, ec2.Port.tcp(3000));
+    // Allow smart-metrics to receive API traffic forwarded by the ALB.
+    this.ecsSg.addIngressRule(this.albSg, ec2.Port.tcp(3001));
     // Allow cross node ecs traffic to the vmstorage write port; this is to insert data via vminsert
     this.ecsSg.addIngressRule(this.ecsSg, ec2.Port.tcp(8400));
     // As above but for the read node; this is so vmselect can query.

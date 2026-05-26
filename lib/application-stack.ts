@@ -8,8 +8,6 @@ import * as elbv2 from 'aws-cdk-lib/aws-elasticloadbalancingv2';
 import * as autoscaling from 'aws-cdk-lib/aws-autoscaling';
 import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as serviceDiscovery from 'aws-cdk-lib/aws-servicediscovery';
-import * as events from 'aws-cdk-lib/aws-events';
-import * as targets from 'aws-cdk-lib/aws-events-targets';
 import { Construct } from 'constructs';
 
 // ------- COMPONENTS AND DESCRIPTIONS --------- //
@@ -54,28 +52,77 @@ export class ApplicationStack extends cdk.Stack {
       vpc: props.vpc,
     });
 
-    // ── EC2 Auto Scaling Group ────────────────────────────────────────────────
-    // provides the actual EC2 instances. Made assumptions about the size we would need. 
-    // instances are placed in the private subnet and use the ECS security group defined in NetworkStack.
-  
-    const interfaceASG = cluster.addCapacity("InterfaceASG", {
-      instanceType: ec2.InstanceType.of(ec2.InstanceClass.T3, ec2.InstanceSize.MEDIUM),
-      desiredCapacity:1,
-      maxCapacity: 1,
-      vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS }
-    });
-    interfaceASG.addSecurityGroup(props.ecsSg);
+    // ── EC2 Auto Scaling Groups + Capacity Providers ──────────────────────────
+    //
+    // Each node gets its own ASG and a named capacity provider.
+    //
+    // Why explicit AutoScalingGroup instead of cluster.addCapacity()?
+    // cluster.addCapacity() creates a capacity provider internally but returns
+    // only the ASG — you get no reference to the provider. Services need to
+    // reference a named capacity provider to pin themselves to a specific node,
+    // so we create the provider explicitly and hold onto it.
+    //
+    // Why EcsOptimizedImage?
+    // Without it the EC2 instance boots as a plain Amazon Linux box with no ECS
+    // agent. EcsOptimizedImage.amazonLinux2() bakes the agent in so the instance
+    // registers with the cluster automatically on first boot.
 
-    const selectASG = cluster.addCapacity("vmselectASG", {
-      instanceType: ec2.InstanceType.of(ec2.InstanceClass.T3, ec2.InstanceSize.SMALL),
+    // ── Interface Node ────────────────────────────────────────────────────────
+    // Hosts: vmagent, vminsert, vector, grafana, smart-metrics.
+    // vmagent, vminsert, and grafana have low continuous resource usage.
+    // Vector handles the full raw metric stream and is the baseline sizing driver.
+    // Smart-metrics is mostly idle but fires a demanding cron job every 24h
+    // (API scraping, data sorting) lasting a couple of minutes — size the instance
+    // to absorb that burst without starving the other services.
+    // No AZ constraint — no EBS on this node.
+    const interfaceAsg = new autoscaling.AutoScalingGroup(this, 'InterfaceASG', {
+      instanceType: ec2.InstanceType.of(ec2.InstanceClass.T3, ec2.InstanceSize.MEDIUM),
+      machineImage: ecs.EcsOptimizedImage.amazonLinux2(),
+      vpc: props.vpc,
       desiredCapacity: 1,
       maxCapacity: 1,
-      vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS }
+      vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
     });
-    selectASG.addSecurityGroup(props.ecsSg);
+    interfaceAsg.addSecurityGroup(props.ecsSg);
+    const interfaceCP = new ecs.AsgCapacityProvider(this, 'InterfaceCP', {
+      autoScalingGroup: interfaceAsg,
+      enableManagedScaling: false,
+      enableManagedTerminationProtection: false,
+    });
+    cluster.addAsgCapacityProvider(interfaceCP);
 
-    const storageASG = cluster.addCapacity("vmstorageASG", {
+    // ── Select Node ───────────────────────────────────────────────────────────
+    // Hosts: vmselect only.
+    // Query processing is CPU/memory intensive per query but does no persistent I/O.
+    // t3.small is the starting point; vertically scale as dashboard load grows.
+    // No AZ constraint — no EBS on this node.
+    const selectAsg = new autoscaling.AutoScalingGroup(this, 'SelectASG', {
+      instanceType: ec2.InstanceType.of(ec2.InstanceClass.T3, ec2.InstanceSize.SMALL),
+      machineImage: ecs.EcsOptimizedImage.amazonLinux2(),
+      vpc: props.vpc,
+      desiredCapacity: 1,
+      maxCapacity: 1,
+      vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
+    });
+    selectAsg.addSecurityGroup(props.ecsSg);
+    const selectCP = new ecs.AsgCapacityProvider(this, 'SelectCP', {
+      autoScalingGroup: selectAsg,
+      enableManagedScaling: false,
+      enableManagedTerminationProtection: false,
+    });
+    cluster.addAsgCapacityProvider(selectCP);
+
+    // ── Storage Node ──────────────────────────────────────────────────────────
+    // Hosts: vmstorage only.
+    // Pinned to privateSubnets[0] — EBS volumes are AZ-specific, so the instance
+    // and its data volume must always land in the same AZ. Changing this subnet
+    // would cause the new instance to boot in a different AZ from the EBS volume,
+    // making the data inaccessible.
+    // deleteOnTermination: false ensures the data volume outlives instance replacement.
+    const storageAsg = new autoscaling.AutoScalingGroup(this, 'StorageASG', {
       instanceType: ec2.InstanceType.of(ec2.InstanceClass.T3, ec2.InstanceSize.MEDIUM),
+      machineImage: ecs.EcsOptimizedImage.amazonLinux2(),
+      vpc: props.vpc,
       desiredCapacity: 1,
       maxCapacity: 1,
       vpcSubnets: { subnets: [props.vpc.privateSubnets[0]] },
@@ -86,18 +133,21 @@ export class ApplicationStack extends cdk.Stack {
           deleteOnTermination: false,
         }),
       }],
-    })
-    storageASG.addSecurityGroup(props.ecsSg);
+    });
+    storageAsg.addSecurityGroup(props.ecsSg);
+    const storageCP = new ecs.AsgCapacityProvider(this, 'StorageCP', {
+      autoScalingGroup: storageAsg,
+      enableManagedScaling: false,
+      enableManagedTerminationProtection: false,
+    });
+    cluster.addAsgCapacityProvider(storageCP);
 
-    // config for the EBS volume. My understanding is weak here, but they are all essential. 
-    storageASG.userData.addCommands(
-      // formats the disk with a file system. 
+    // EBS mount commands — run on every boot of the storage node.
+    // blkid check prevents mkfs from reformatting an already-populated volume on reboot.
+    storageAsg.userData.addCommands(
       'blkid /dev/xvdb || mkfs -t xfs /dev/xvdb',
-      // cretes the folder the disk will be accessible through.
       'mkdir -p /data/vm-storage',
-      // attached the disk to that folde.r 
       'mount /dev/xvdb /data/vm-storage || true',
-      // tells the os to repeat on every reboot. 
       "echo '/dev/xvdb /data/vm-storage xfs defaults,nofail 0 2' >> /etc/fstab",
     );
 
@@ -302,10 +352,15 @@ export class ApplicationStack extends cdk.Stack {
       host: { sourcePath: '/shared/vmagent' },
     });
     const smartMetricsContainer = smartMetricsTaskDef.addContainer('SmartMetricsContainer', {
-      // placeholder — swap for the real smart-metrics image when implemented
+      // placeholder — swap for the real smart-metrics image when implemented.
+      // The real image should run a persistent API server on port 3001 with an
+      // internal scheduler that fires the cron job every 24h.
       image: ecs.ContainerImage.fromRegistry('alpine:latest'),
       memoryLimitMiB: 256,
-      command: ['echo', 'smart-metrics placeholder'],
+      portMappings: [{ containerPort: 3001 }],
+      // keeps the placeholder container alive so ECS doesn't restart loop it.
+      // replace with the real entrypoint when the image is ready.
+      command: ['tail', '-f', '/dev/null'],
       logging: ecs.LogDrivers.awsLogs({
         streamPrefix: 'smart-metrics',
         logGroup: new logs.LogGroup(this, 'SmartMetricsLogGroup', {
@@ -320,72 +375,103 @@ export class ApplicationStack extends cdk.Stack {
       readOnly: false,
     });
 
-    // EventBridge triggers smart-metrics every 24 hours as a one-shot ECS task.
-    // It runs on the interface node so it shares the /shared/vmagent host volume with vmagent.
-    const smartMetricsSchedule = new events.Rule(this, 'SmartMetricsSchedule', {
-      schedule: events.Schedule.rate(cdk.Duration.hours(24)),
-    });
-    smartMetricsSchedule.addTarget(new targets.EcsTask({
-      cluster: cluster,
+    // smart-metrics runs as a persistent service on the interface node.
+    // It serves the grafana plugin's API on port 3001 and handles its own
+    // 24h cron job internally — no EventBridge needed.
+    const smartMetricsService = new ecs.Ec2Service(this, 'SmartMetricsService', {
+      cluster,
       taskDefinition: smartMetricsTaskDef,
-      subnetSelection: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
-      securityGroups: [props.ecsSg],
-    }));
+      desiredCount: 1,
+      minHealthyPercent: 0,
+      circuitBreaker: { rollback: true },
+      capacityProviderStrategies: [{
+        capacityProvider: interfaceCP.capacityProviderName,
+        weight: 1,
+      }],
+    });
+    smartMetricsService.node.addDependency(interfaceCP);
 
     // ── ECS Services ──────────────────────────────────────────────────────────
-    // one per container, each linked to the cluster and task definition.
+    //
+    // capacityProviderStrategies pins each service to its designated node.
+    // Without this, ECS treats all three nodes as a shared pool and places
+    // tasks arbitrarily — vmstorage could land on a node with no EBS volume.
+    //
+    // node.addDependency ensures CloudFormation waits for the capacity provider
+    // to be registered before creating the service, avoiding a race where ECS
+    // tries to place the task before the target instance exists.
+    //
+    // minHealthyPercent / maxHealthyPercent govern rolling deployment behaviour
+    // (not autoscaling). 0 min means brief downtime is acceptable during deploys.
+    // vmstorage uses maxHealthyPercent: 100 to enforce stop-before-start,
+    // preventing two storage tasks from ever writing to the same EBS volume.
+
     const vmAgentService = new ecs.Ec2Service(this, 'VmAgentService', {
       cluster: cluster,
       taskDefinition: vmAgentTaskDef,
       desiredCount: 1,
       minHealthyPercent: 0,
       circuitBreaker: { rollback: true },
+      capacityProviderStrategies: [{
+        capacityProvider: interfaceCP.capacityProviderName,
+        weight: 1,
+      }],
     });
-    vmAgentService.node.addDependency(interfaceASG);
+    vmAgentService.node.addDependency(interfaceCP);
 
-    // the min and max % governs how the instance replacement is handled. DEPLOYMENT only, doesnt
-    // affect scaling. 
-    // 0 min means it is acceptable for their to be brief times where the service may be down
-    // max healthy defaults to 200 unless stated (vm storage, where we CANNOT have two simultaneous
-    // instances). 200 means that two can be up at once. 
     const vmInsertService = new ecs.Ec2Service(this, 'VmInsertService', {
       cluster: cluster,
       taskDefinition: vmInsertTaskDef,
       desiredCount: 1,
       minHealthyPercent: 0,
       circuitBreaker: { rollback: true },
+      capacityProviderStrategies: [{
+        capacityProvider: interfaceCP.capacityProviderName,
+        weight: 1,
+      }],
     });
-    vmInsertService.node.addDependency(interfaceASG);
+    vmInsertService.node.addDependency(interfaceCP);
 
     const vmSelectService = new ecs.Ec2Service(this, 'VmSelectService', {
       cluster: cluster,
       taskDefinition: vmSelectTaskDef,
       desiredCount: 1,
       minHealthyPercent: 0,
-      // cb ensures that repeated failed deployments trigger a rollback to previous success deployment. 
       circuitBreaker: { rollback: true },
+      capacityProviderStrategies: [{
+        capacityProvider: selectCP.capacityProviderName,
+        weight: 1,
+      }],
+      // registers vmselect.trickl.local in Route 53 so grafana and other
+      // internal callers can resolve it without hardcoding an IP address.
       cloudMapOptions: {
-        name: "vmselect",
+        name: 'vmselect',
         cloudMapNamespace: namespace,
-      }
+      },
     });
-    vmSelectService.node.addDependency(selectASG);
+    vmSelectService.node.addDependency(selectCP);
 
     const vmStorageService = new ecs.Ec2Service(this, 'VmStorageService', {
       cluster: cluster,
       taskDefinition: vmStorageTaskDef,
       desiredCount: 1,
-      // mhp: 100 + mhp: 0 ensures ECS stops the old task before starting the new one —
-      // prevents two storage tasks writing to the same EBS volume simultaneously.
+      // stop-before-start: prevents two vmstorage tasks from running simultaneously
+      // and writing to the same EBS volume, which would corrupt the data.
       maxHealthyPercent: 100,
       minHealthyPercent: 0,
       circuitBreaker: { rollback: true },
+      capacityProviderStrategies: [{
+        capacityProvider: storageCP.capacityProviderName,
+        weight: 1,
+      }],
+      // registers vmstorage.trickl.local so vminsert and vmselect can reach it
+      // across nodes without hardcoded addresses.
       cloudMapOptions: {
-        name: "vmstorage",
+        name: 'vmstorage',
         cloudMapNamespace: namespace,
-      }
+      },
     });
-    vmStorageService.node.addDependency(storageASG);
+    vmStorageService.node.addDependency(storageCP);
 
     const grafanaService = new ecs.Ec2Service(this, 'GrafanaService', {
       cluster: cluster,
@@ -393,8 +479,25 @@ export class ApplicationStack extends cdk.Stack {
       desiredCount: 1,
       minHealthyPercent: 0,
       circuitBreaker: { rollback: true },
+      capacityProviderStrategies: [{
+        capacityProvider: interfaceCP.capacityProviderName,
+        weight: 1,
+      }],
     });
-    grafanaService.node.addDependency(interfaceASG);
+    grafanaService.node.addDependency(interfaceCP);
+
+    const vectorService = new ecs.Ec2Service(this, 'VectorService', {
+      cluster: cluster,
+      taskDefinition: vectorTaskDef,
+      desiredCount: 1,
+      minHealthyPercent: 0,
+      circuitBreaker: { rollback: true },
+      capacityProviderStrategies: [{
+        capacityProvider: interfaceCP.capacityProviderName,
+        weight: 1,
+      }],
+    });
+    vectorService.node.addDependency(interfaceCP);
 
     // ── Application Load Balancer ─────────────────────────────────────────────
     // sits in the public subnet, listeners on port 8429 (metrics) and 3000 (Grafana)
@@ -443,25 +546,26 @@ export class ApplicationStack extends cdk.Stack {
       },
     });
 
-    // // ── Lambda + EventBridge ──────────────────────────────────────────────────
-    // // Lambda reads from VM and Grafana endpoints every 24hrs and writes to RDS
-    // // EventBridge triggers the Lambda on a cron schedule
-    // const metricsReader = new lambda.Function(this, 'MetricsReaderFunction', {
-    //   runtime: lambda.Runtime.NODEJS_22_X,
-    //   handler: 'index.handler',
-    //   // placeholder:real implementation reads from VM/Grafana and writes to RDS
-    //   code: lambda.Code.fromInline('exports.handler = async () => {};'),
-    //   role: lambdaExecutionRole,
-    //   vpc: props.vpc,
-    //   securityGroups: [props.lambdaSg],
-    //   vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
-    //   timeout: cdk.Duration.minutes(5),
-    // });
-
-    // const metricsSchedule = new events.Rule(this, 'MetricsReaderSchedule', {
-    //   schedule: events.Schedule.rate(cdk.Duration.hours(24)),
-    // });
-    // metricsSchedule.addTarget(new targets.LambdaFunction(metricsReader));
+    // smart-metrics API — consumed by the grafana frontend plugin.
+    // health check will fail against the placeholder image; this is expected
+    // until the real smart-metrics image is deployed.
+    const smartMetricsListener = alb.addListener('SmartMetricsListener', {
+      port: 3001,
+      protocol: elbv2.ApplicationProtocol.HTTP,
+      open: false,
+    });
+    smartMetricsListener.addTargets('SmartMetricsTarget', {
+      port: 3001,
+      protocol: elbv2.ApplicationProtocol.HTTP,
+      targets: [smartMetricsService.loadBalancerTarget({
+        containerName: 'SmartMetricsContainer',
+        containerPort: 3001,
+      })],
+      healthCheck: {
+        path: '/health',
+        interval: cdk.Duration.seconds(30),
+      },
+    });
 
     // ── EBS Volume ────────────────────────────────────────────────────────────
     // attached to the EC2 instance, mounted by VM Storage for persistent data
