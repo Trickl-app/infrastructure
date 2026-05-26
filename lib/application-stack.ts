@@ -191,6 +191,17 @@ export class ApplicationStack extends cdk.Stack {
     // });
 
 
+    // ── Application Load Balancer ─────────────────────────────────────────────
+    // Declared here — before the task definitions — so alb.loadBalancerDnsName is
+    // available as a CloudFormation token when building the grafana container's
+    // environment variables. Listeners are added later, after the services exist.
+    const alb = new elbv2.ApplicationLoadBalancer(this, 'MetropolisALB', {
+      vpc: props.vpc,
+      internetFacing: true,
+      securityGroup: props.albSg,
+      vpcSubnets: { subnetType: ec2.SubnetType.PUBLIC },
+    });
+
     // ── ECS Task Definitions ──────────────────────────────────────────────────
     // Instructions for ECS on how to run the containers. Just a spec
     // executionRole grants ECS permission to write logs to CloudWatch for each task.
@@ -302,15 +313,24 @@ export class ApplicationStack extends cdk.Stack {
       }),
     });
 
-    // grafana does not require a command property as it doesnt communicate with other services. 
+    // grafana is built from a custom Dockerfile that bakes in the plugin and provisioning config.
+    // No command override needed — the image's own entrypoint handles startup.
     const grafanaTaskDef = new ecs.Ec2TaskDefinition(this, 'GrafanaTaskDef', {
       executionRole: taskExecutionRole,
       networkMode: ecs.NetworkMode.HOST,
     });
     grafanaTaskDef.addContainer('GrafanaContainer', {
-      image: ecs.ContainerImage.fromRegistry('grafana/grafana:latest'),
+      image: ecs.ContainerImage.fromAsset('../../local_host_pipeline/grafana'),
       memoryLimitMiB: 512,
       portMappings: [{ containerPort: 3000 }],
+      environment: {
+        GF_SECURITY_ADMIN_USER: 'admin',
+        // TODO pre-prod: move to Secrets Manager
+        GF_SECURITY_ADMIN_PASSWORD: 'admin',
+        // injected into provisioning/plugins/apps.yaml via Grafana's ${VAR} interpolation.
+        // alb.loadBalancerDnsName resolves to the actual ALB hostname at deploy time.
+        SMART_METRICS_API_URL: `http://${alb.loadBalancerDnsName}:3001`,
+      },
       logging: ecs.LogDrivers.awsLogs({
         streamPrefix: 'grafana',
         logGroup: new logs.LogGroup(this, 'GrafanaLogGroup', {
