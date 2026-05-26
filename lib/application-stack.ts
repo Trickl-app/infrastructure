@@ -318,21 +318,24 @@ export class ApplicationStack extends cdk.Stack {
     });
 
     // vector task definition
+    // fromAsset builds the Dockerfile at the given path — vector.toml is COPY'd into
+    // the image at build time, so no host volume is needed (and mounting one would
+    // shadow the baked-in config, leaving the container with an empty /etc/vector).
     const vectorTaskDef = new ecs.Ec2TaskDefinition(this, "VectorTaskDef", {
       executionRole: taskExecutionRole,
       taskRole: vectorTaskRole,
       networkMode: ecs.NetworkMode.HOST
     });
-    vectorTaskDef.addVolume({
-      name: "vector-toml",
-      host: { sourcePath: "/etc/vector" }
-    });
-    const vectorContainer = vectorTaskDef.addContainer("VectorContainer", {
-      image: ecs.ContainerImage.fromRegistry("timberio/vector:latest"),
+    vectorTaskDef.addContainer("VectorContainer", {
+      image: ecs.ContainerImage.fromAsset('../../local_host_pipeline/vector'),
       memoryLimitMiB: 512,
       portMappings: [{ containerPort: 9090 }],
-      // tell vector where to find its config file (mounted from the host volume below)
       command: ['--config', '/etc/vector/vector.toml'],
+      // bucket name is injected at runtime; vector.toml references it as ${S3_BUCKET_NAME}.
+      // auth is handled by the IAM task role — no AWS credentials needed here.
+      environment: {
+        S3_BUCKET_NAME: props.metricsBucket.bucketName,
+      },
       logging: ecs.LogDrivers.awsLogs({
         streamPrefix: 'vector',
         logGroup: new logs.LogGroup(this, 'VectorLogGroup', {
@@ -341,11 +344,6 @@ export class ApplicationStack extends cdk.Stack {
         }),
       }),
     });
-    vectorContainer.addMountPoints({
-      containerPath: "/etc/vector",
-      sourceVolume: "vector-toml",
-      readOnly: true
-    })
 
     // ── Smart Metrics (scheduled reader) ─────────────────────────────────────
     // Placeholder task that runs on a 24h schedule via EventBridge.
