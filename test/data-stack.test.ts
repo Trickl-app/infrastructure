@@ -1,6 +1,5 @@
 import * as cdk from 'aws-cdk-lib/core';
-import * as ec2 from 'aws-cdk-lib/aws-ec2';
-import { Template } from 'aws-cdk-lib/assertions';
+import { Template, Match } from 'aws-cdk-lib/assertions';
 import { DataStack } from '../lib/data-stack';
 import { NetworkStack } from '../lib/network-stack';
 
@@ -15,7 +14,7 @@ const template = Template.fromStack(stack);
 
 // ── RDS ────────────────────────────────────────────────────────────────────
 
-// checks that only one RDS instance is created. 
+// checks that only one RDS instance is created
 test('RDS instance is created', () => {
   template.resourceCountIs('AWS::RDS::DBInstance', 1);
 });
@@ -27,7 +26,6 @@ test('RDS instance uses Postgres engine', () => {
   });
 });
 
-// 
 test('RDS instance has deletion protection enabled', () => {
   template.hasResourceProperties('AWS::RDS::DBInstance', {
     DeletionProtection: true,
@@ -47,16 +45,35 @@ test('RDS instance type is t3.micro', () => {
   });
 });
 
+// ── S3 Metrics Bucket ──────────────────────────────────────────────────────
+// Vector writes raw metrics to this bucket. EBS lives in ApplicationStack,
+// not here — the old EBS tests in this file were misplaced and have been removed.
 
-// ── EBS ────────────────────────────────────────────────────────────────────
-
-test('EBS volume is created', () => {
-  template.resourceCountIs('AWS::EC2::Volume', 1);
+test('S3 metrics bucket is created', () => {
+  template.resourceCountIs('AWS::S3::Bucket', 1);
 });
 
-test('EBS volume is 100GB gp3', () => {
-  template.hasResourceProperties('AWS::EC2::Volume', {
-    Size: 100,
-    VolumeType: 'gp3',
+// confirms all public access to the raw metrics archive is blocked
+test('S3 metrics bucket blocks all public access', () => {
+  template.hasResourceProperties('AWS::S3::Bucket', {
+    PublicAccessBlockConfiguration: Match.objectLike({
+      BlockPublicAcls: true,
+      BlockPublicPolicy: true,
+      IgnorePublicAcls: true,
+      RestrictPublicBuckets: true,
+    }),
+  });
+});
+
+// confirms data at rest is encrypted using S3-managed keys
+test('S3 metrics bucket uses S3-managed encryption', () => {
+  template.hasResourceProperties('AWS::S3::Bucket', {
+    BucketEncryption: Match.objectLike({
+      ServerSideEncryptionConfiguration: Match.arrayWith([
+        Match.objectLike({
+          ServerSideEncryptionByDefault: Match.objectLike({ SSEAlgorithm: 'AES256' }),
+        }),
+      ]),
+    }),
   });
 });
