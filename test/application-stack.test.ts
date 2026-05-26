@@ -66,11 +66,10 @@ test('vmagent task definition shares the /shared/vmagent host volume', () => {
 });
 
 // ── ECS Services ───────────────────────────────────────────────────────────
-// vmagent, vminsert, vmselect, vmstorage, grafana, vector = 6 long-running services.
-// smart-metrics is EventBridge-triggered (not a persistent ECS Service resource).
+// vmagent, vminsert, vmselect, vmstorage, grafana, vector, smart-metrics = 7
 
-test('six ECS services are created', () => {
-  template.resourceCountIs('AWS::ECS::Service', 6);
+test('seven ECS services are created', () => {
+  template.resourceCountIs('AWS::ECS::Service', 7);
 });
 
 // all six services should have circuit breakers configured
@@ -100,9 +99,9 @@ test('ALB is created and is internet-facing', () => {
   });
 });
 
-// one for vmagent (8429) and one for grafana (3000)
-test('two listeners are created', () => {
-  template.resourceCountIs('AWS::ElasticLoadBalancingV2::Listener', 2);
+// vmagent (8429), grafana (3000), smart-metrics (3001)
+test('three listeners are created', () => {
+  template.resourceCountIs('AWS::ElasticLoadBalancingV2::Listener', 3);
 });
 
 test('telemetry listener is on port 8429', () => {
@@ -119,14 +118,14 @@ test('grafana listener is on port 3000', () => {
   });
 });
 
-// ── Smart Metrics + EventBridge ───────────────────────────────────────────
-// Lambda was removed. smart-metrics runs as an ECS task on a 24h EventBridge
-// schedule instead, sharing the interface node's /shared/vmagent host volume.
+// ── Smart Metrics ─────────────────────────────────────────────────────────
+// smart-metrics is a persistent service on the interface node. Its 24h cron
+// job is scheduled internally — no EventBridge rule needed.
 
-// CDK normalises Duration.hours(24) to "rate(1 day)" in CloudFormation
-test('EventBridge rule triggers smart-metrics on a 24-hour schedule', () => {
-  template.hasResourceProperties('AWS::Events::Rule', {
-    ScheduleExpression: 'rate(1 day)',
+test('smart-metrics listener is on port 3001', () => {
+  template.hasResourceProperties('AWS::ElasticLoadBalancingV2::Listener', {
+    Port: 3001,
+    Protocol: 'HTTP',
   });
 });
 

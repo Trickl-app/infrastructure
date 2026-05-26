@@ -8,8 +8,6 @@ import * as elbv2 from 'aws-cdk-lib/aws-elasticloadbalancingv2';
 import * as autoscaling from 'aws-cdk-lib/aws-autoscaling';
 import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as serviceDiscovery from 'aws-cdk-lib/aws-servicediscovery';
-import * as events from 'aws-cdk-lib/aws-events';
-import * as targets from 'aws-cdk-lib/aws-events-targets';
 import { Construct } from 'constructs';
 
 // ------- COMPONENTS AND DESCRIPTIONS --------- //
@@ -354,10 +352,15 @@ export class ApplicationStack extends cdk.Stack {
       host: { sourcePath: '/shared/vmagent' },
     });
     const smartMetricsContainer = smartMetricsTaskDef.addContainer('SmartMetricsContainer', {
-      // placeholder — swap for the real smart-metrics image when implemented
+      // placeholder — swap for the real smart-metrics image when implemented.
+      // The real image should run a persistent API server on port 3001 with an
+      // internal scheduler that fires the cron job every 24h.
       image: ecs.ContainerImage.fromRegistry('alpine:latest'),
       memoryLimitMiB: 256,
-      command: ['echo', 'smart-metrics placeholder'],
+      portMappings: [{ containerPort: 3001 }],
+      // keeps the placeholder container alive so ECS doesn't restart loop it.
+      // replace with the real entrypoint when the image is ready.
+      command: ['tail', '-f', '/dev/null'],
       logging: ecs.LogDrivers.awsLogs({
         streamPrefix: 'smart-metrics',
         logGroup: new logs.LogGroup(this, 'SmartMetricsLogGroup', {
@@ -372,17 +375,21 @@ export class ApplicationStack extends cdk.Stack {
       readOnly: false,
     });
 
-    // EventBridge triggers smart-metrics every 24 hours as a one-shot ECS task.
-    // It runs on the interface node so it shares the /shared/vmagent host volume with vmagent.
-    const smartMetricsSchedule = new events.Rule(this, 'SmartMetricsSchedule', {
-      schedule: events.Schedule.rate(cdk.Duration.hours(24)),
-    });
-    smartMetricsSchedule.addTarget(new targets.EcsTask({
-      cluster: cluster,
+    // smart-metrics runs as a persistent service on the interface node.
+    // It serves the grafana plugin's API on port 3001 and handles its own
+    // 24h cron job internally — no EventBridge needed.
+    const smartMetricsService = new ecs.Ec2Service(this, 'SmartMetricsService', {
+      cluster,
       taskDefinition: smartMetricsTaskDef,
-      subnetSelection: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
-      securityGroups: [props.ecsSg],
-    }));
+      desiredCount: 1,
+      minHealthyPercent: 0,
+      circuitBreaker: { rollback: true },
+      capacityProviderStrategies: [{
+        capacityProvider: interfaceCP.capacityProviderName,
+        weight: 1,
+      }],
+    });
+    smartMetricsService.node.addDependency(interfaceCP);
 
     // ── ECS Services ──────────────────────────────────────────────────────────
     //
@@ -539,25 +546,26 @@ export class ApplicationStack extends cdk.Stack {
       },
     });
 
-    // // ── Lambda + EventBridge ──────────────────────────────────────────────────
-    // // Lambda reads from VM and Grafana endpoints every 24hrs and writes to RDS
-    // // EventBridge triggers the Lambda on a cron schedule
-    // const metricsReader = new lambda.Function(this, 'MetricsReaderFunction', {
-    //   runtime: lambda.Runtime.NODEJS_22_X,
-    //   handler: 'index.handler',
-    //   // placeholder:real implementation reads from VM/Grafana and writes to RDS
-    //   code: lambda.Code.fromInline('exports.handler = async () => {};'),
-    //   role: lambdaExecutionRole,
-    //   vpc: props.vpc,
-    //   securityGroups: [props.lambdaSg],
-    //   vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
-    //   timeout: cdk.Duration.minutes(5),
-    // });
-
-    // const metricsSchedule = new events.Rule(this, 'MetricsReaderSchedule', {
-    //   schedule: events.Schedule.rate(cdk.Duration.hours(24)),
-    // });
-    // metricsSchedule.addTarget(new targets.LambdaFunction(metricsReader));
+    // smart-metrics API — consumed by the grafana frontend plugin.
+    // health check will fail against the placeholder image; this is expected
+    // until the real smart-metrics image is deployed.
+    const smartMetricsListener = alb.addListener('SmartMetricsListener', {
+      port: 3001,
+      protocol: elbv2.ApplicationProtocol.HTTP,
+      open: false,
+    });
+    smartMetricsListener.addTargets('SmartMetricsTarget', {
+      port: 3001,
+      protocol: elbv2.ApplicationProtocol.HTTP,
+      targets: [smartMetricsService.loadBalancerTarget({
+        containerName: 'SmartMetricsContainer',
+        containerPort: 3001,
+      })],
+      healthCheck: {
+        path: '/health',
+        interval: cdk.Duration.seconds(30),
+      },
+    });
 
     // ── EBS Volume ────────────────────────────────────────────────────────────
     // attached to the EC2 instance, mounted by VM Storage for persistent data
