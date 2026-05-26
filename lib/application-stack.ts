@@ -368,11 +368,10 @@ export class ApplicationStack extends cdk.Stack {
       }),
     });
 
-    // ── Smart Metrics (scheduled reader) ─────────────────────────────────────
-    // Placeholder task that runs on a 24h schedule via EventBridge.
-    // Reads from vmselect and Grafana, writes aggregations.yaml to the shared
-    // host volume, then triggers vmagent to reload its config.
-    // Replace the image with the real smart-metrics image when ready.
+    // ── Smart Metrics ─────────────────────────────────────────────────────────
+    // Persistent API server on port 3001; internal scheduler fires the cron job
+    // every 24h. Shares /shared/vmagent with vmagent so it can write
+    // aggregations.yml and trigger a hot reload.
     const smartMetricsTaskDef = new ecs.Ec2TaskDefinition(this, 'SmartMetricsTaskDef', {
       executionRole: taskExecutionRole,
       networkMode: ecs.NetworkMode.HOST,
@@ -382,15 +381,32 @@ export class ApplicationStack extends cdk.Stack {
       host: { sourcePath: '/shared/vmagent' },
     });
     const smartMetricsContainer = smartMetricsTaskDef.addContainer('SmartMetricsContainer', {
-      // placeholder — swap for the real smart-metrics image when implemented.
-      // The real image should run a persistent API server on port 3001 with an
-      // internal scheduler that fires the cron job every 24h.
-      image: ecs.ContainerImage.fromRegistry('alpine:latest'),
+      image: ecs.ContainerImage.fromAsset('../../local_host_pipeline/smart_metrics'),
       memoryLimitMiB: 256,
       portMappings: [{ containerPort: 3001 }],
-      // keeps the placeholder container alive so ECS doesn't restart loop it.
-      // replace with the real entrypoint when the image is ready.
-      command: ['tail', '-f', '/dev/null'],
+      environment: {
+        // same node as grafana and vmagent — HOST mode means localhost resolves correctly
+        GRAFANA_URL: 'http://localhost:3000',
+        GRAFANA_USER: 'admin',
+        // TODO pre-prod: move to Secrets Manager
+        GRAFANA_PASSWORD: 'admin',
+        VMSELECT_ENDPOINT: 'http://vmselect.trickl.local:8481/select/0/prometheus/api/v1',
+        YAML_PATH: '/mnt/vmagent/aggregations.yml',
+        VMAGENT_URL: 'http://localhost:8429',
+        // non-sensitive DB connection fields passed as plain env vars
+        DB_HOST: props.rdsEndpoint,
+        DB_PORT: '5432',
+        DB_NAME: 'metropolis',
+      },
+      // DB_USER and DB_PASSWORD are pulled from the RDS-generated Secrets Manager secret
+      // at container startup — never stored in plaintext in the task definition.
+      // NOTE: database.ts currently reads DATABASE_URL as a single string.
+      // Update it to construct the connection string from DB_HOST, DB_PORT,
+      // DB_NAME, DB_USER, and DB_PASSWORD before deploying.
+      secrets: {
+        DB_USER: ecs.Secret.fromSecretsManager(props.dbSecret, 'username'),
+        DB_PASSWORD: ecs.Secret.fromSecretsManager(props.dbSecret, 'password'),
+      },
       logging: ecs.LogDrivers.awsLogs({
         streamPrefix: 'smart-metrics',
         logGroup: new logs.LogGroup(this, 'SmartMetricsLogGroup', {
@@ -529,16 +545,11 @@ export class ApplicationStack extends cdk.Stack {
     });
     vectorService.node.addDependency(interfaceCP);
 
-    // ── Application Load Balancer ─────────────────────────────────────────────
-    // sits in the public subnet, listeners on port 8429 (metrics) and 3000 (Grafana)
-    const alb = new elbv2.ApplicationLoadBalancer(this, 'MetropolisALB', {
-      vpc: props.vpc,
-      internetFacing: true,
-      securityGroup: props.albSg,
-      vpcSubnets: { subnetType: ec2.SubnetType.PUBLIC },
-    });
-
-    // both these listeners will need HTTPS protocol in production. 
+    // ── ALB Listeners ─────────────────────────────────────────────────────────
+    // ALB itself is declared before the task definitions so its DNS name token
+    // is available when building container environment variables.
+    // Listeners are added here, after the services, because they need service references.
+    // Both listeners will need HTTPS protocol in production. 
     // open: false:albSg already defines inbound rules, prevents CDK adding a duplicate 0.0.0.0/0 ingress.
     const telemetryListener = alb.addListener('TelemetryListener', {
       port: 8429,

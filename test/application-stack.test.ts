@@ -16,6 +16,8 @@ const stack = new ApplicationStack(app, 'TestApplicationStack', {
   albSg: network.albSg,
   ecsSg: network.ecsSg,
   metricsBucket: data.metricsBucket,
+  rdsEndpoint: data.rdsEndpoint,
+  dbSecret: data.dbSecret,
 });
 const template = Template.fromStack(stack);
 
