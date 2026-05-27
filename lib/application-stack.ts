@@ -243,9 +243,16 @@ export class ApplicationStack extends cdk.Stack {
       command: [
         // on-disk WAL buffer — replays buffered metrics if vminsert or vector is temporarily down
         '--remoteWrite.tmpDataPath=/vmagentdata',
+        // URL[0]: vminsert — aggregation applied, raw input dropped → vminsert receives aggregated only.
         '-remoteWrite.url=http://localhost:8480/insert/0/prometheus',
         "--remoteWrite.streamAggr.config=/etc/vmagent/aggregations.yml",
         "--remoteWrite.streamAggr.dropInput=true",
+        // URL[1]: vector — should receive raw metrics only.
+        // FIX NEEDED: vmagent matches positional flags by occurrence count. Only one
+        // streamAggr.config is provided above, so vmagent reuses it for this URL too,
+        // causing vector to receive both raw and aggregated metrics (dropInput=false
+        // means both are forwarded). To fix, add '--remoteWrite.streamAggr.config='
+        // (empty string) here so vmagent knows this URL has no aggregation config.
         "--remoteWrite.url=http://localhost:9090/",
         "--remoteWrite.streamAggr.dropInput=false"
       ],
