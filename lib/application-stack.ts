@@ -190,6 +190,14 @@ export class ApplicationStack extends cdk.Stack {
       assumedBy: new iam.ServicePrincipal('ecs-tasks.amazonaws.com'),
     });
     props.metricsBucket.grantWrite(vectorTaskRole);
+    // grantWrite only covers object-level actions (PutObject etc. on bucket/*).
+    // Vector's S3 sink healthcheck calls HeadBucket, which requires s3:ListBucket
+    // on the bucket ARN itself — without it Vector logs "Invalid credentials" and
+    // refuses to start writing. Grant it explicitly on the bucket ARN here.
+    vectorTaskRole.addToPrincipalPolicy(new iam.PolicyStatement({
+      actions: ['s3:ListBucket'],
+      resources: [props.metricsBucket.bucketArn],
+    }));
 
     //role for ASG to register EC2 instances with ECS cluster
     //EDIT: This is commented out for now because it appears it might not be 
