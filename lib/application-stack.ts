@@ -277,9 +277,13 @@ export class ApplicationStack extends cdk.Stack {
       }),
     });
 
+    // vmselect sits alone on the select node with no co-located containers, so
+    // HOST mode buys nothing. AWS_VPC gives each task its own ENI, which lets
+    // Cloud Map register a proper A record instead of the SRV record CDK forces
+    // for HOST/bridge mode — plain hostname lookups (from grafana etc.) need A.
     const vmSelectTaskDef = new ecs.Ec2TaskDefinition(this, 'VmSelectTaskDef', {
       executionRole: taskExecutionRole,
-      networkMode: ecs.NetworkMode.HOST,
+      networkMode: ecs.NetworkMode.AWS_VPC,
     });
     vmSelectTaskDef.addContainer('VmSelectContainer', {
       image: ecs.ContainerImage.fromRegistry('victoriametrics/vmselect:latest'),
@@ -300,9 +304,11 @@ export class ApplicationStack extends cdk.Stack {
 
     // VM Storage needs a volume mount for the EBS volume:handled in the EBS section below.
     // the container reference is stored so we can call addMountPoints() on it later.
+    // Same reasoning as vmselect — AWS_VPC mode for A record DNS. Host volumes
+    // (for EBS) still work in AWS_VPC mode; it only affects the network interface.
     const vmStorageTaskDef = new ecs.Ec2TaskDefinition(this, 'VmStorageTaskDef', {
       executionRole: taskExecutionRole,
-      networkMode: ecs.NetworkMode.HOST,
+      networkMode: ecs.NetworkMode.AWS_VPC,
     });
     const vmStorageContainer = vmStorageTaskDef.addContainer('VmStorageContainer', {
       image: ecs.ContainerImage.fromRegistry('victoriametrics/vmstorage:latest'),
@@ -513,6 +519,14 @@ export class ApplicationStack extends cdk.Stack {
       },
     });
     vmSelectService.node.addDependency(selectCP);
+    // Ec2Service doesn't expose vpcSubnets/securityGroups for awsvpc mode (those
+    // are FargateService props), so we set networkConfiguration via escape hatch.
+    (vmSelectService.node.defaultChild as ecs.CfnService).networkConfiguration = {
+      awsvpcConfiguration: {
+        subnets: props.vpc.privateSubnets.map(s => s.subnetId),
+        securityGroups: [props.ecsSg.securityGroupId],
+      },
+    };
 
     const vmStorageService = new ecs.Ec2Service(this, 'VmStorageService', {
       cluster: cluster,
@@ -537,6 +551,15 @@ export class ApplicationStack extends cdk.Stack {
       },
     });
     vmStorageService.node.addDependency(storageCP);
+    // Same escape hatch as vmselect. Storage node is always in privateSubnets[0]
+    // (AZ-pinned for EBS), but we pass all private subnets — ECS uses whichever
+    // matches the AZ of the EC2 instance the capacity provider placed the task on.
+    (vmStorageService.node.defaultChild as ecs.CfnService).networkConfiguration = {
+      awsvpcConfiguration: {
+        subnets: props.vpc.privateSubnets.map(s => s.subnetId),
+        securityGroups: [props.ecsSg.securityGroupId],
+      },
+    };
 
     const grafanaService = new ecs.Ec2Service(this, 'GrafanaService', {
       cluster: cluster,
