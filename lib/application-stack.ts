@@ -8,6 +8,7 @@ import * as elbv2 from 'aws-cdk-lib/aws-elasticloadbalancingv2';
 import * as autoscaling from 'aws-cdk-lib/aws-autoscaling';
 import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as serviceDiscovery from 'aws-cdk-lib/aws-servicediscovery';
+import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import { Construct } from 'constructs';
 
 // ------- COMPONENTS AND DESCRIPTIONS --------- //
@@ -29,6 +30,8 @@ interface ApplicationStackProps extends cdk.StackProps {
   albSg: ec2.ISecurityGroup;
   ecsSg: ec2.ISecurityGroup;
   metricsBucket: s3.IBucket;
+  rdsEndpoint: string;
+  dbSecret: secretsmanager.ISecret;
 }
 
 export class ApplicationStack extends cdk.Stack {
@@ -142,6 +145,17 @@ export class ApplicationStack extends cdk.Stack {
     });
     cluster.addAsgCapacityProvider(storageCP);
 
+    // Interface node bootstrap — run on every boot.
+    // Creates the shared vmagent config directory and seeds a valid empty
+    // aggregations.yml so vmagent can start before smart-metrics has written
+    // its first real config. Smart-metrics overwrites this file on its first
+    // cron run and signals vmagent to hot-reload.
+    // -n flag: only write the file if it doesn't already exist (idempotent on reboot).
+    interfaceAsg.userData.addCommands(
+      'mkdir -p /shared/vmagent',
+      '[ -f /shared/vmagent/aggregations.yml ] || echo "[]" > /shared/vmagent/aggregations.yml',
+    );
+
     // EBS mount commands — run on every boot of the storage node.
     // blkid check prevents mkfs from reformatting an already-populated volume on reboot.
     storageAsg.userData.addCommands(
@@ -176,6 +190,14 @@ export class ApplicationStack extends cdk.Stack {
       assumedBy: new iam.ServicePrincipal('ecs-tasks.amazonaws.com'),
     });
     props.metricsBucket.grantWrite(vectorTaskRole);
+    // grantWrite only covers object-level actions (PutObject etc. on bucket/*).
+    // Vector's S3 sink healthcheck calls HeadBucket, which requires s3:ListBucket
+    // on the bucket ARN itself — without it Vector logs "Invalid credentials" and
+    // refuses to start writing. Grant it explicitly on the bucket ARN here.
+    vectorTaskRole.addToPrincipalPolicy(new iam.PolicyStatement({
+      actions: ['s3:ListBucket'],
+      resources: [props.metricsBucket.bucketArn],
+    }));
 
     //role for ASG to register EC2 instances with ECS cluster
     //EDIT: This is commented out for now because it appears it might not be 
@@ -187,6 +209,17 @@ export class ApplicationStack extends cdk.Stack {
     //   ],
     // });
 
+
+    // ── Application Load Balancer ─────────────────────────────────────────────
+    // Declared here — before the task definitions — so alb.loadBalancerDnsName is
+    // available as a CloudFormation token when building the grafana container's
+    // environment variables. Listeners are added later, after the services exist.
+    const alb = new elbv2.ApplicationLoadBalancer(this, 'MetropolisALB', {
+      vpc: props.vpc,
+      internetFacing: true,
+      securityGroup: props.albSg,
+      vpcSubnets: { subnetType: ec2.SubnetType.PUBLIC },
+    });
 
     // ── ECS Task Definitions ──────────────────────────────────────────────────
     // Instructions for ECS on how to run the containers. Just a spec
@@ -208,11 +241,20 @@ export class ApplicationStack extends cdk.Stack {
       memoryLimitMiB: 512,
       portMappings: [{ containerPort: 8429 }],
       command: [
+        // on-disk WAL buffer — replays buffered metrics if vminsert or vector is temporarily down
+        '--remoteWrite.tmpDataPath=/vmagentdata',
+        // URL[0]: vminsert — aggregation applied, raw input dropped → vminsert receives aggregated only.
         '-remoteWrite.url=http://localhost:8480/insert/0/prometheus',
         "--remoteWrite.streamAggr.config=/etc/vmagent/aggregations.yml",
         "--remoteWrite.streamAggr.dropInput=true",
+        // URL[1]: vector — should receive raw metrics only.
+        // FIX NEEDED: vmagent matches positional flags by occurrence count. Only one
+        // streamAggr.config is provided above, so vmagent reuses it for this URL too,
+        // causing vector to receive both raw and aggregated metrics (dropInput=false
+        // means both are forwarded). To fix, add '--remoteWrite.streamAggr.config='
+        // (empty string) here so vmagent knows this URL has no aggregation config.
         "--remoteWrite.url=http://localhost:9090/",
-        "--remoteWrite.streamAggr.dropInput=false" 
+        "--remoteWrite.streamAggr.dropInput=false"
       ],
       logging: ecs.LogDrivers.awsLogs({
         streamPrefix: 'vm-agent',
@@ -237,7 +279,10 @@ export class ApplicationStack extends cdk.Stack {
       image: ecs.ContainerImage.fromRegistry('victoriametrics/vminsert:latest'),
       memoryLimitMiB: 512,
       portMappings: [{ containerPort: 8480 }],
-      command: ['-storageNode=vmstorage.trickl.local:8400'],
+      command: [
+        '-storageNode=vmstorage.trickl.local:8400',
+        '-enableMetadata=true',
+      ],
       logging: ecs.LogDrivers.awsLogs({
         streamPrefix: 'vm-insert',
         logGroup: new logs.LogGroup(this, 'VmInsertLogGroup', {
@@ -247,15 +292,22 @@ export class ApplicationStack extends cdk.Stack {
       }),
     });
 
+    // vmselect sits alone on the select node with no co-located containers, so
+    // HOST mode buys nothing. AWS_VPC gives each task its own ENI, which lets
+    // Cloud Map register a proper A record instead of the SRV record CDK forces
+    // for HOST/bridge mode — plain hostname lookups (from grafana etc.) need A.
     const vmSelectTaskDef = new ecs.Ec2TaskDefinition(this, 'VmSelectTaskDef', {
       executionRole: taskExecutionRole,
-      networkMode: ecs.NetworkMode.HOST,
+      networkMode: ecs.NetworkMode.AWS_VPC,
     });
     vmSelectTaskDef.addContainer('VmSelectContainer', {
       image: ecs.ContainerImage.fromRegistry('victoriametrics/vmselect:latest'),
       memoryLimitMiB: 512,
       portMappings: [{ containerPort: 8481 }],
-      command: ['-storageNode=vmstorage.trickl.local:8401'],
+      command: [
+        '-storageNode=vmstorage.trickl.local:8401',
+        '--cacheDataPath=/cache',
+      ],
       logging: ecs.LogDrivers.awsLogs({
         streamPrefix: 'vm-select',
         logGroup: new logs.LogGroup(this, 'VmSelectLogGroup', {
@@ -267,9 +319,11 @@ export class ApplicationStack extends cdk.Stack {
 
     // VM Storage needs a volume mount for the EBS volume:handled in the EBS section below.
     // the container reference is stored so we can call addMountPoints() on it later.
+    // Same reasoning as vmselect — AWS_VPC mode for A record DNS. Host volumes
+    // (for EBS) still work in AWS_VPC mode; it only affects the network interface.
     const vmStorageTaskDef = new ecs.Ec2TaskDefinition(this, 'VmStorageTaskDef', {
       executionRole: taskExecutionRole,
-      networkMode: ecs.NetworkMode.HOST,
+      networkMode: ecs.NetworkMode.AWS_VPC,
     });
     const vmStorageContainer = vmStorageTaskDef.addContainer('VmStorageContainer', {
       image: ecs.ContainerImage.fromRegistry('victoriametrics/vmstorage:latest'),
@@ -280,7 +334,10 @@ export class ApplicationStack extends cdk.Stack {
         { containerPort: 8400 }, // vminsert write protocol
         { containerPort: 8401 }, // vmselect read protocol
       ],
-      command: ['-storageDataPath=/victoria-metrics-data'],
+      command: [
+        '-storageDataPath=/victoria-metrics-data',
+        '--retentionPeriod=1',
+      ],
       logging: ecs.LogDrivers.awsLogs({
         streamPrefix: 'vm-storage',
         logGroup: new logs.LogGroup(this, 'VmStorageLogGroup', {
@@ -290,15 +347,24 @@ export class ApplicationStack extends cdk.Stack {
       }),
     });
 
-    // grafana does not require a command property as it doesnt communicate with other services. 
+    // grafana is built from a custom Dockerfile that bakes in the plugin and provisioning config.
+    // No command override needed — the image's own entrypoint handles startup.
     const grafanaTaskDef = new ecs.Ec2TaskDefinition(this, 'GrafanaTaskDef', {
       executionRole: taskExecutionRole,
       networkMode: ecs.NetworkMode.HOST,
     });
     grafanaTaskDef.addContainer('GrafanaContainer', {
-      image: ecs.ContainerImage.fromRegistry('grafana/grafana:latest'),
+      image: ecs.ContainerImage.fromAsset('../local_host_pipeline/grafana'),
       memoryLimitMiB: 512,
       portMappings: [{ containerPort: 3000 }],
+      environment: {
+        GF_SECURITY_ADMIN_USER: 'admin',
+        // TODO pre-prod: move to Secrets Manager
+        GF_SECURITY_ADMIN_PASSWORD: 'admin',
+        // injected into provisioning/plugins/apps.yaml via Grafana's ${VAR} interpolation.
+        // alb.loadBalancerDnsName resolves to the actual ALB hostname at deploy time.
+        SMART_METRICS_API_URL: `http://${alb.loadBalancerDnsName}:3001`,
+      },
       logging: ecs.LogDrivers.awsLogs({
         streamPrefix: 'grafana',
         logGroup: new logs.LogGroup(this, 'GrafanaLogGroup', {
@@ -309,21 +375,24 @@ export class ApplicationStack extends cdk.Stack {
     });
 
     // vector task definition
+    // fromAsset builds the Dockerfile at the given path — vector.toml is COPY'd into
+    // the image at build time, so no host volume is needed (and mounting one would
+    // shadow the baked-in config, leaving the container with an empty /etc/vector).
     const vectorTaskDef = new ecs.Ec2TaskDefinition(this, "VectorTaskDef", {
       executionRole: taskExecutionRole,
       taskRole: vectorTaskRole,
       networkMode: ecs.NetworkMode.HOST
     });
-    vectorTaskDef.addVolume({
-      name: "vector-toml",
-      host: { sourcePath: "/etc/vector" }
-    });
-    const vectorContainer = vectorTaskDef.addContainer("VectorContainer", {
-      image: ecs.ContainerImage.fromRegistry("timberio/vector:latest"),
+    vectorTaskDef.addContainer("VectorContainer", {
+      image: ecs.ContainerImage.fromAsset('../local_host_pipeline/vector'),
       memoryLimitMiB: 512,
       portMappings: [{ containerPort: 9090 }],
-      // tell vector where to find its config file (mounted from the host volume below)
       command: ['--config', '/etc/vector/vector.toml'],
+      // bucket name is injected at runtime; vector.toml references it as ${S3_BUCKET_NAME}.
+      // auth is handled by the IAM task role — no AWS credentials needed here.
+      environment: {
+        S3_BUCKET_NAME: props.metricsBucket.bucketName,
+      },
       logging: ecs.LogDrivers.awsLogs({
         streamPrefix: 'vector',
         logGroup: new logs.LogGroup(this, 'VectorLogGroup', {
@@ -332,17 +401,11 @@ export class ApplicationStack extends cdk.Stack {
         }),
       }),
     });
-    vectorContainer.addMountPoints({
-      containerPath: "/etc/vector",
-      sourceVolume: "vector-toml",
-      readOnly: true
-    })
 
-    // ── Smart Metrics (scheduled reader) ─────────────────────────────────────
-    // Placeholder task that runs on a 24h schedule via EventBridge.
-    // Reads from vmselect and Grafana, writes aggregations.yaml to the shared
-    // host volume, then triggers vmagent to reload its config.
-    // Replace the image with the real smart-metrics image when ready.
+    // ── Smart Metrics ─────────────────────────────────────────────────────────
+    // Persistent API server on port 3001; internal scheduler fires the cron job
+    // every 24h. Shares /shared/vmagent with vmagent so it can write
+    // aggregations.yml and trigger a hot reload.
     const smartMetricsTaskDef = new ecs.Ec2TaskDefinition(this, 'SmartMetricsTaskDef', {
       executionRole: taskExecutionRole,
       networkMode: ecs.NetworkMode.HOST,
@@ -352,15 +415,32 @@ export class ApplicationStack extends cdk.Stack {
       host: { sourcePath: '/shared/vmagent' },
     });
     const smartMetricsContainer = smartMetricsTaskDef.addContainer('SmartMetricsContainer', {
-      // placeholder — swap for the real smart-metrics image when implemented.
-      // The real image should run a persistent API server on port 3001 with an
-      // internal scheduler that fires the cron job every 24h.
-      image: ecs.ContainerImage.fromRegistry('alpine:latest'),
+      image: ecs.ContainerImage.fromAsset('../local_host_pipeline/smart_metrics'),
       memoryLimitMiB: 256,
       portMappings: [{ containerPort: 3001 }],
-      // keeps the placeholder container alive so ECS doesn't restart loop it.
-      // replace with the real entrypoint when the image is ready.
-      command: ['tail', '-f', '/dev/null'],
+      environment: {
+        // same node as grafana and vmagent — HOST mode means localhost resolves correctly
+        GRAFANA_URL: 'http://localhost:3000',
+        GRAFANA_USER: 'admin',
+        // TODO pre-prod: move to Secrets Manager
+        GRAFANA_PASSWORD: 'admin',
+        VMSELECT_ENDPOINT: 'http://vmselect.trickl.local:8481/select/0/prometheus/api/v1',
+        YAML_PATH: '/mnt/vmagent/aggregations.yml',
+        VMAGENT_URL: 'http://localhost:8429',
+        // non-sensitive DB connection fields passed as plain env vars
+        DB_HOST: props.rdsEndpoint,
+        DB_PORT: '5432',
+        DB_NAME: 'metropolis',
+      },
+      // DB_USER and DB_PASSWORD are pulled from the RDS-generated Secrets Manager secret
+      // at container startup — never stored in plaintext in the task definition.
+      // NOTE: database.ts currently reads DATABASE_URL as a single string.
+      // Update it to construct the connection string from DB_HOST, DB_PORT,
+      // DB_NAME, DB_USER, and DB_PASSWORD before deploying.
+      secrets: {
+        DB_USER: ecs.Secret.fromSecretsManager(props.dbSecret, 'username'),
+        DB_PASSWORD: ecs.Secret.fromSecretsManager(props.dbSecret, 'password'),
+      },
       logging: ecs.LogDrivers.awsLogs({
         streamPrefix: 'smart-metrics',
         logGroup: new logs.LogGroup(this, 'SmartMetricsLogGroup', {
@@ -447,9 +527,21 @@ export class ApplicationStack extends cdk.Stack {
       cloudMapOptions: {
         name: 'vmselect',
         cloudMapNamespace: namespace,
+        // HOST network mode: CDK defaults to SRV records (like bridge mode), but
+        // plain hostname lookups query for A records. Force A so that
+        // vmselect.trickl.local resolves correctly from grafana.
+        dnsRecordType: serviceDiscovery.DnsRecordType.A,
       },
     });
     vmSelectService.node.addDependency(selectCP);
+    // Ec2Service doesn't expose vpcSubnets/securityGroups for awsvpc mode (those
+    // are FargateService props), so we set networkConfiguration via escape hatch.
+    (vmSelectService.node.defaultChild as ecs.CfnService).networkConfiguration = {
+      awsvpcConfiguration: {
+        subnets: props.vpc.privateSubnets.map(s => s.subnetId),
+        securityGroups: [props.ecsSg.securityGroupId],
+      },
+    };
 
     const vmStorageService = new ecs.Ec2Service(this, 'VmStorageService', {
       cluster: cluster,
@@ -469,9 +561,20 @@ export class ApplicationStack extends cdk.Stack {
       cloudMapOptions: {
         name: 'vmstorage',
         cloudMapNamespace: namespace,
+        // Same reason as vmselect — force A records for plain hostname resolution.
+        dnsRecordType: serviceDiscovery.DnsRecordType.A,
       },
     });
     vmStorageService.node.addDependency(storageCP);
+    // Same escape hatch as vmselect. Storage node is always in privateSubnets[0]
+    // (AZ-pinned for EBS), but we pass all private subnets — ECS uses whichever
+    // matches the AZ of the EC2 instance the capacity provider placed the task on.
+    (vmStorageService.node.defaultChild as ecs.CfnService).networkConfiguration = {
+      awsvpcConfiguration: {
+        subnets: props.vpc.privateSubnets.map(s => s.subnetId),
+        securityGroups: [props.ecsSg.securityGroupId],
+      },
+    };
 
     const grafanaService = new ecs.Ec2Service(this, 'GrafanaService', {
       cluster: cluster,
@@ -499,16 +602,11 @@ export class ApplicationStack extends cdk.Stack {
     });
     vectorService.node.addDependency(interfaceCP);
 
-    // ── Application Load Balancer ─────────────────────────────────────────────
-    // sits in the public subnet, listeners on port 8429 (metrics) and 3000 (Grafana)
-    const alb = new elbv2.ApplicationLoadBalancer(this, 'MetropolisALB', {
-      vpc: props.vpc,
-      internetFacing: true,
-      securityGroup: props.albSg,
-      vpcSubnets: { subnetType: ec2.SubnetType.PUBLIC },
-    });
-
-    // both these listeners will need HTTPS protocol in production. 
+    // ── ALB Listeners ─────────────────────────────────────────────────────────
+    // ALB itself is declared before the task definitions so its DNS name token
+    // is available when building container environment variables.
+    // Listeners are added here, after the services, because they need service references.
+    // Both listeners will need HTTPS protocol in production. 
     // open: false:albSg already defines inbound rules, prevents CDK adding a duplicate 0.0.0.0/0 ingress.
     const telemetryListener = alb.addListener('TelemetryListener', {
       port: 8429,
