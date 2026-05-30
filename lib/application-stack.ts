@@ -361,9 +361,6 @@ export class ApplicationStack extends cdk.Stack {
         GF_SECURITY_ADMIN_USER: 'admin',
         // TODO pre-prod: move to Secrets Manager
         GF_SECURITY_ADMIN_PASSWORD: 'admin',
-        // injected into provisioning/plugins/apps.yaml via Grafana's ${VAR} interpolation.
-        // alb.loadBalancerDnsName resolves to the actual ALB hostname at deploy time.
-        SMART_METRICS_API_URL: `http://${alb.loadBalancerDnsName}:3001`,
       },
       logging: ecs.LogDrivers.awsLogs({
         streamPrefix: 'grafana',
@@ -644,26 +641,6 @@ export class ApplicationStack extends cdk.Stack {
       },
     });
 
-    // smart-metrics API — consumed by the grafana frontend plugin.
-    // health check will fail against the placeholder image; this is expected
-    // until the real smart-metrics image is deployed.
-    const smartMetricsListener = alb.addListener('SmartMetricsListener', {
-      port: 3001,
-      protocol: elbv2.ApplicationProtocol.HTTP,
-      open: false,
-    });
-    smartMetricsListener.addTargets('SmartMetricsTarget', {
-      port: 3001,
-      protocol: elbv2.ApplicationProtocol.HTTP,
-      targets: [smartMetricsService.loadBalancerTarget({
-        containerName: 'SmartMetricsContainer',
-        containerPort: 3001,
-      })],
-      healthCheck: {
-        path: '/health',
-        interval: cdk.Duration.seconds(30),
-      },
-    });
 
     // ── EBS Volume ────────────────────────────────────────────────────────────
     // attached to the EC2 instance, mounted by VM Storage for persistent data
