@@ -53,6 +53,18 @@ export class ApplicationStack extends cdk.Stack {
       description: 'The domain/subdomain pointing at this ALB (e.g. grafana.yourdomain.com). Used as the Cognito OIDC callback URL.',
     });
 
+    const vmagentAuthPassword = new cdk.CfnParameter(this, 'VmagentAuthPassword', {
+      type: 'String',
+      noEcho: true,
+      description: 'Password senders must supply when pushing metrics to vmagent (HTTP basic auth).',
+    });
+
+    // Stored in Secrets Manager so it is never written in plaintext to the
+    // task definition. ECS injects it as VMAGENT_AUTH_PASSWORD at container startup.
+    const vmagentAuthSecret = new secretsmanager.Secret(this, 'VmagentAuthSecret', {
+      secretStringValue: cdk.SecretValue.cfnParameter(vmagentAuthPassword),
+    });
+
     // ── Cognito ───────────────────────────────────────────────────────────────
     // Self-signup disabled — only admin-created users can authenticate.
     const userPool = new cognito.UserPool(this, 'UserPool', {
@@ -285,27 +297,35 @@ export class ApplicationStack extends cdk.Stack {
       host: { sourcePath: "/shared/vmagent" }
     });
     const VmAgentContainer = vmAgentTaskDef.addContainer('VmAgentContainer', {
-      // docker image to pull
       image: ecs.ContainerImage.fromRegistry('victoriametrics/vmagent:latest'),
-      // default assumption
       memoryLimitMiB: 512,
       portMappings: [{ containerPort: 8429 }],
+      // entryPoint overrides the image's default entrypoint with a shell so that
+      // $VMAGENT_AUTH_PASSWORD (injected by ECS from Secrets Manager) is expanded
+      // before vmagent receives it as a flag value. Without a shell, the literal
+      // string "$VMAGENT_AUTH_PASSWORD" would be passed to vmagent unchanged.
+      entryPoint: ['/bin/sh', '-c'],
       command: [
-        // on-disk WAL buffer — replays buffered metrics if vminsert or vector is temporarily down
-        '--remoteWrite.tmpDataPath=/vmagentdata',
-        // URL[0]: vminsert — aggregation applied, raw input dropped → vminsert receives aggregated only.
-        '-remoteWrite.url=http://localhost:8480/insert/0/prometheus',
-        "--remoteWrite.streamAggr.config=/etc/vmagent/aggregations.yml",
-        "--remoteWrite.streamAggr.dropInput=true",
-        // URL[1]: vector — should receive raw metrics only.
-        // FIX NEEDED: vmagent matches positional flags by occurrence count. Only one
-        // streamAggr.config is provided above, so vmagent reuses it for this URL too,
-        // causing vector to receive both raw and aggregated metrics (dropInput=false
-        // means both are forwarded). To fix, add '--remoteWrite.streamAggr.config='
-        // (empty string) here so vmagent knows this URL has no aggregation config.
-        "--remoteWrite.url=http://localhost:9090/",
-        "--remoteWrite.streamAggr.dropInput=false"
+        // Single string — the shell expands $VMAGENT_AUTH_PASSWORD then exec's vmagent.
+        // FIX NEEDED on URL[1]: vmagent matches positional flags by occurrence count. Only one
+        // streamAggr.config is provided (for URL[0]), so vmagent reuses it for URL[1] too,
+        // causing vector to receive both raw and aggregated metrics. Fix by adding
+        // --remoteWrite.streamAggr.config= (empty string) before URL[1].
+        [
+          '/vmagent-prod',
+          '--httpAuth.username=metrics',
+          '--httpAuth.password=$VMAGENT_AUTH_PASSWORD',
+          '--remoteWrite.tmpDataPath=/vmagentdata',
+          '-remoteWrite.url=http://localhost:8480/insert/0/prometheus',
+          '--remoteWrite.streamAggr.config=/etc/vmagent/aggregations.yml',
+          '--remoteWrite.streamAggr.dropInput=true',
+          '--remoteWrite.url=http://localhost:9090/',
+          '--remoteWrite.streamAggr.dropInput=false',
+        ].join(' '),
       ],
+      secrets: {
+        VMAGENT_AUTH_PASSWORD: ecs.Secret.fromSecretsManager(vmagentAuthSecret),
+      },
       logging: ecs.LogDrivers.awsLogs({
         streamPrefix: 'vm-agent',
         logGroup: new logs.LogGroup(this, 'VmAgentLogGroup', {

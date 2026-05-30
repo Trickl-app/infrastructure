@@ -97,20 +97,24 @@ From the `infrastructure/` directory:
 npm install
 ```
 
-Then deploy, supplying the two required parameters:
+Then deploy, supplying the three required parameters:
 
 ```bash
 npx cdk deploy --all \
   --parameters ApplicationStack:CertificateArn=YOUR_CERTIFICATE_ARN \
-  --parameters ApplicationStack:DomainName=YOUR_DOMAIN
+  --parameters ApplicationStack:DomainName=YOUR_DOMAIN \
+  --parameters ApplicationStack:VmagentAuthPassword=YOUR_CHOSEN_PASSWORD
 ```
 
 For example:
 ```bash
 npx cdk deploy --all \
   --parameters ApplicationStack:CertificateArn=arn:aws:acm:eu-west-1:123456789012:certificate/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx \
-  --parameters ApplicationStack:DomainName=grafana.yourdomain.com
+  --parameters ApplicationStack:DomainName=grafana.yourdomain.com \
+  --parameters ApplicationStack:VmagentAuthPassword=a-strong-password-here
 ```
+
+`VmagentAuthPassword` is the password that any system pushing metrics to the pipeline must supply. Choose something strong — a random string of at least 20 characters is recommended. You will need to share this password with whoever configures the metric senders (see the Sending Metrics section below).
 
 CDK will show you a summary of the changes and ask for confirmation before creating any resources. Type `y` to proceed.
 
@@ -165,10 +169,22 @@ All future visits will use the session cookie set by the load balancer. The sess
 
 ## Sending metrics
 
-Metrics are pushed to vmagent over HTTPS on port 8429:
+Metrics are pushed to vmagent over HTTPS on port 8429. The endpoint requires HTTP basic authentication using the `VmagentAuthPassword` you supplied at deploy time. The username is always `metrics`.
 
-```
-https://grafana.yourdomain.com:8429
+### Prometheus / vmagent remote_write
+
+Add the following to your Prometheus or vmagent configuration, replacing the placeholders with your values:
+
+```yaml
+remote_write:
+  - url: https://YOUR_DOMAIN:8429/api/v1/write
+    basic_auth:
+      username: metrics
+      password: YOUR_VMAGENT_AUTH_PASSWORD
 ```
 
-Update any Prometheus `remote_write` or other sender configuration to use `https://` and port `8429`. The load balancer terminates TLS and forwards to vmagent internally.
+### Other senders
+
+Any tool that supports Prometheus remote write (e.g. Grafana Agent, OpenTelemetry Collector) follows the same pattern — set the remote write URL to `https://YOUR_DOMAIN:8429/api/v1/write` and supply the username `metrics` and your chosen password in the basic auth fields.
+
+If you need to rotate the password in future, redeploy the stack with a new `VmagentAuthPassword` value and update the configuration of all metric senders.
