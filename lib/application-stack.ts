@@ -442,6 +442,7 @@ export class ApplicationStack extends cdk.Stack {
         GF_AUTH_PROXY_HEADER_NAME: 'X-Amzn-Oidc-Identity',
         GF_AUTH_PROXY_HEADER_PROPERTY: 'username',
         GF_AUTH_PROXY_AUTO_SIGN_UP: 'true',
+        GF_USERS_AUTO_ASSIGN_ORG_ROLE: 'Admin',
       },
       logging: ecs.LogDrivers.awsLogs({
         streamPrefix: 'grafana',
