@@ -101,22 +101,22 @@ test('ALB is created and is internet-facing', () => {
   });
 });
 
-// vmagent (8429), grafana (3000), smart-metrics (3001)
+// HTTP redirect (80), authenticated Grafana HTTPS (443), telemetry HTTPS (8429)
 test('three listeners are created', () => {
   template.resourceCountIs('AWS::ElasticLoadBalancingV2::Listener', 3);
 });
 
-test('telemetry listener is on port 8429', () => {
+test('telemetry listener is HTTPS on port 8429', () => {
   template.hasResourceProperties('AWS::ElasticLoadBalancingV2::Listener', {
     Port: 8429,
-    Protocol: 'HTTP',
+    Protocol: 'HTTPS',
   });
 });
 
-test('grafana listener is on port 3000', () => {
+test('grafana listener is HTTPS on port 443', () => {
   template.hasResourceProperties('AWS::ElasticLoadBalancingV2::Listener', {
-    Port: 3000,
-    Protocol: 'HTTP',
+    Port: 443,
+    Protocol: 'HTTPS',
   });
 });
 
@@ -124,10 +124,55 @@ test('grafana listener is on port 3000', () => {
 // smart-metrics is a persistent service on the interface node. Its 24h cron
 // job is scheduled internally — no EventBridge rule needed.
 
-test('smart-metrics listener is on port 3001', () => {
-  template.hasResourceProperties('AWS::ElasticLoadBalancingV2::Listener', {
+test('smart-metrics is not exposed as a public ALB listener', () => {
+  template.resourcePropertiesCountIs('AWS::ElasticLoadBalancingV2::Listener', {
     Port: 3001,
-    Protocol: 'HTTP',
+  }, 0);
+});
+
+test('OpenAI API key is accepted as a hidden deploy parameter', () => {
+  template.hasParameter('OpenAiApiKey', {
+    Type: 'String',
+    NoEcho: true,
+  });
+});
+
+test('OpenAI API key is stored in Secrets Manager', () => {
+  template.hasResourceProperties('AWS::SecretsManager::Secret', {
+    SecretString: {
+      Ref: 'OpenAiApiKey',
+    },
+  });
+});
+
+test('smart-metrics receives OpenAI model as environment variable', () => {
+  template.hasResourceProperties('AWS::ECS::TaskDefinition', {
+    ContainerDefinitions: Match.arrayWith([
+      Match.objectLike({
+        Name: 'SmartMetricsContainer',
+        Environment: Match.arrayWith([
+          Match.objectLike({
+            Name: 'OPENAI_MODEL',
+            Value: 'gpt-4.1-mini',
+          }),
+        ]),
+      }),
+    ]),
+  });
+});
+
+test('smart-metrics receives OpenAI API key as an ECS secret', () => {
+  template.hasResourceProperties('AWS::ECS::TaskDefinition', {
+    ContainerDefinitions: Match.arrayWith([
+      Match.objectLike({
+        Name: 'SmartMetricsContainer',
+        Secrets: Match.arrayWith([
+          Match.objectLike({
+            Name: 'OPENAI_API_KEY',
+          }),
+        ]),
+      }),
+    ]),
   });
 });
 

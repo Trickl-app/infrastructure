@@ -97,13 +97,14 @@ From the `infrastructure/` directory:
 npm install
 ```
 
-Then deploy, supplying the three required parameters:
+Then deploy, supplying the four required parameters:
 
 ```bash
 npx cdk deploy --all \
   --parameters ApplicationStack:CertificateArn=YOUR_CERTIFICATE_ARN \
   --parameters ApplicationStack:DomainName=YOUR_DOMAIN \
-  --parameters ApplicationStack:VmagentAuthPassword=YOUR_CHOSEN_PASSWORD
+  --parameters ApplicationStack:VmagentAuthPassword=YOUR_CHOSEN_PASSWORD \
+  --parameters ApplicationStack:OpenAiApiKey=YOUR_OPENAI_API_KEY
 ```
 
 For example:
@@ -111,10 +112,13 @@ For example:
 npx cdk deploy --all \
   --parameters ApplicationStack:CertificateArn=arn:aws:acm:eu-west-1:123456789012:certificate/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx \
   --parameters ApplicationStack:DomainName=grafana.yourdomain.com \
-  --parameters ApplicationStack:VmagentAuthPassword=a-strong-password-here
+  --parameters ApplicationStack:VmagentAuthPassword=a-strong-password-here \
+  --parameters ApplicationStack:OpenAiApiKey=sk-your-openai-api-key
 ```
 
 `VmagentAuthPassword` is the password that any system pushing metrics to the pipeline must supply. Choose something strong — a random string of at least 20 characters is recommended. You will need to share this password with whoever configures the metric senders (see the Sending Metrics section below).
+
+`OpenAiApiKey` is used only by the smart-metrics backend for the AI Investigator. CDK stores it in Secrets Manager and injects it into the ECS task as `OPENAI_API_KEY`; it is not exposed to Grafana or the browser.
 
 CDK will show you a summary of the changes and ask for confirmation before creating any resources. Type `y` to proceed.
 
