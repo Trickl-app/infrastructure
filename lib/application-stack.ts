@@ -518,6 +518,7 @@ export class ApplicationStack extends cdk.Stack {
         YAML_PATH: '/mnt/vmagent/aggregations.yml',
         DROP_LABEL_PATH: '/mnt/vmagent/relabel.yml',
         VMAGENT_URL: 'http://localhost:8429',
+        VMAGENT_AUTH_USERNAME: 'metrics',
         OPENAI_MODEL: 'gpt-4.1-mini',
         // non-sensitive DB connection fields passed as plain env vars
         DB_HOST: props.rdsEndpoint,
@@ -533,6 +534,7 @@ export class ApplicationStack extends cdk.Stack {
         DB_USER: ecs.Secret.fromSecretsManager(props.dbSecret, 'username'),
         DB_PASSWORD: ecs.Secret.fromSecretsManager(props.dbSecret, 'password'),
         OPENAI_API_KEY: ecs.Secret.fromSecretsManager(openAiApiKeySecret),
+        VMAGENT_AUTH_PASSWORD: ecs.Secret.fromSecretsManager(vmagentAuthSecret),
       },
       logging: ecs.LogDrivers.awsLogs({
         streamPrefix: 'smart-metrics',
