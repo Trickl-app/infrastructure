@@ -229,6 +229,7 @@ export class ApplicationStack extends cdk.Stack {
       'mkdir -p /shared/vmagent',
       '[ -f /shared/vmagent/aggregations.yml ] || echo "[]" > /shared/vmagent/aggregations.yml',
       '[ -f /shared/vmagent/relabel.yml ] || echo "[]" > /shared/vmagent/relabel.yml',
+      '[ -f /shared/vmagent/vector_relabel.yml ] || printf \'- source_labels: [__name__]\\n  regex: .+:.+\\n  action: drop\\n\' > /shared/vmagent/vector_relabel.yml',
     );
 
     // EBS mount commands — run on every boot of the storage node.
@@ -328,10 +329,10 @@ export class ApplicationStack extends cdk.Stack {
           // url[0]: vminsert receives only aggregated and relabeled metrics
           '--remoteWrite.url=http://localhost:8480/insert/0/prometheus',
           '--remoteWrite.streamAggr.config=/etc/vmagent/aggregations.yml',
-          '--remoteWrite.streamAggr.dropInput=true',
           '--remoteWrite.relabelConfig=/etc/vmagent/relabel.yml',
-          // url[1]: vector receives raw metrics for S3 archival — no aggregation or relabeling
+          // url[1]: vector receives raw metrics only — aggregated output (colon-suffixed) is dropped
           '--remoteWrite.url=http://localhost:9090/',
+          '--remoteWrite.relabelConfig=/etc/vmagent/vector_relabel.yml',
         ].join(' '),
       ],
       secrets: {
