@@ -42,9 +42,9 @@ export class DataStack extends cdk.Stack {
       deletionProtection: true,
       // auto-generates a username/password and stores them in Secrets Manager.
       // smart-metrics reads DB_USER and DB_PASSWORD from the secret at runtime.
-      credentials: rds.Credentials.fromGeneratedSecret('metropolis'),
+      credentials: rds.Credentials.fromGeneratedSecret('trickl'),
       // explicit db name so smart-metrics can reference it as a known constant.
-      databaseName: 'metropolis',
+      databaseName: 'trickl',
     });
 
     // rds endpoint and secret made public for ApplicationStack to consume

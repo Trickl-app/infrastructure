@@ -97,7 +97,7 @@ export class ApplicationStack extends cdk.Stack {
     // a user-supplied parameter.
     const userPoolDomain = userPool.addDomain('CognitoDomain', {
       cognitoDomain: {
-        domainPrefix: `metropolis-${cdk.Aws.ACCOUNT_ID}`,
+        domainPrefix: `trickl-${cdk.Aws.ACCOUNT_ID}`,
       },
     });
 
@@ -125,7 +125,7 @@ export class ApplicationStack extends cdk.Stack {
 
     // ── ECS Cluster ───────────────────────────────────────────────────────────
     // Just the shell. Will need to run .addCapacity to acutally add compute. 
-    const cluster = new ecs.Cluster(this, 'MetropolisCluster', {
+    const cluster = new ecs.Cluster(this, 'TricklCluster', {
       vpc: props.vpc,
     });
 
@@ -289,7 +289,7 @@ export class ApplicationStack extends cdk.Stack {
     // Declared here — before the task definitions — so alb.loadBalancerDnsName is
     // available as a CloudFormation token when building the grafana container's
     // environment variables. Listeners are added later, after the services exist.
-    const alb = new elbv2.ApplicationLoadBalancer(this, 'MetropolisALB', {
+    const alb = new elbv2.ApplicationLoadBalancer(this, 'TricklALB', {
       vpc: props.vpc,
       internetFacing: true,
       securityGroup: props.albSg,
@@ -340,7 +340,7 @@ export class ApplicationStack extends cdk.Stack {
       logging: ecs.LogDrivers.awsLogs({
         streamPrefix: 'vm-agent',
         logGroup: new logs.LogGroup(this, 'VmAgentLogGroup', {
-          logGroupName: '/metropolis/vm-agent',
+          logGroupName: '/trickl/vm-agent',
           removalPolicy: cdk.RemovalPolicy.DESTROY,
         }),
       }),
@@ -367,7 +367,7 @@ export class ApplicationStack extends cdk.Stack {
       logging: ecs.LogDrivers.awsLogs({
         streamPrefix: 'vm-insert',
         logGroup: new logs.LogGroup(this, 'VmInsertLogGroup', {
-          logGroupName: '/metropolis/vm-insert',
+          logGroupName: '/trickl/vm-insert',
           removalPolicy: cdk.RemovalPolicy.DESTROY,
         }),
       }),
@@ -392,7 +392,7 @@ export class ApplicationStack extends cdk.Stack {
       logging: ecs.LogDrivers.awsLogs({
         streamPrefix: 'vm-select',
         logGroup: new logs.LogGroup(this, 'VmSelectLogGroup', {
-          logGroupName: '/metropolis/vm-select',
+          logGroupName: '/trickl/vm-select',
           removalPolicy: cdk.RemovalPolicy.DESTROY,
         }),
       }),
@@ -422,7 +422,7 @@ export class ApplicationStack extends cdk.Stack {
       logging: ecs.LogDrivers.awsLogs({
         streamPrefix: 'vm-storage',
         logGroup: new logs.LogGroup(this, 'VmStorageLogGroup', {
-          logGroupName: '/metropolis/vm-storage',
+          logGroupName: '/trickl/vm-storage',
           removalPolicy: cdk.RemovalPolicy.DESTROY,
         }),
       }),
@@ -458,7 +458,7 @@ export class ApplicationStack extends cdk.Stack {
       logging: ecs.LogDrivers.awsLogs({
         streamPrefix: 'grafana',
         logGroup: new logs.LogGroup(this, 'GrafanaLogGroup', {
-          logGroupName: '/metropolis/grafana',
+          logGroupName: '/trickl/grafana',
           removalPolicy: cdk.RemovalPolicy.DESTROY,
         }),
       }),
@@ -486,7 +486,7 @@ export class ApplicationStack extends cdk.Stack {
       logging: ecs.LogDrivers.awsLogs({
         streamPrefix: 'vector',
         logGroup: new logs.LogGroup(this, 'VectorLogGroup', {
-          logGroupName: '/metropolis/vector',
+          logGroupName: '/trickl/vector',
           removalPolicy: cdk.RemovalPolicy.DESTROY,
         }),
       }),
@@ -521,7 +521,7 @@ export class ApplicationStack extends cdk.Stack {
         // non-sensitive DB connection fields passed as plain env vars
         DB_HOST: props.rdsEndpoint,
         DB_PORT: '5432',
-        DB_NAME: 'metropolis',
+        DB_NAME: 'trickl',
       },
       // DB_USER and DB_PASSWORD are pulled from the RDS-generated Secrets Manager secret
       // at container startup — never stored in plaintext in the task definition.
@@ -536,7 +536,7 @@ export class ApplicationStack extends cdk.Stack {
       logging: ecs.LogDrivers.awsLogs({
         streamPrefix: 'smart-metrics',
         logGroup: new logs.LogGroup(this, 'SmartMetricsLogGroup', {
-          logGroupName: '/metropolis/smart-metrics',
+          logGroupName: '/trickl/smart-metrics',
           removalPolicy: cdk.RemovalPolicy.DESTROY,
         }),
       }),
