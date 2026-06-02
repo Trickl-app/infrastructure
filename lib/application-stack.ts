@@ -332,10 +332,11 @@ export class ApplicationStack extends cdk.Stack {
           // url[0]: vminsert receives only aggregated and relabeled metrics
           '--remoteWrite.url=http://localhost:8480/insert/0/prometheus',
           '--remoteWrite.streamAggr.config=/etc/vmagent/aggregations.yml',
-          '--remoteWrite.relabelConfig=/etc/vmagent/relabel.yml',
+          '--remoteWrite.streamAggr.dropInput=true',
+          '--remoteWrite.urlRelabelConfig=/etc/vmagent/relabel.yml',
           // url[1]: vector receives raw metrics only — aggregated output (colon-suffixed) is dropped
           '--remoteWrite.url=http://localhost:9090/',
-          '--remoteWrite.relabelConfig=/etc/vmagent/vector_relabel.yml',
+          '--remoteWrite.urlRelabelConfig=/etc/vmagent/vector_relabel.yml',
         ].join(' '),
       ],
       secrets: {
