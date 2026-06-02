@@ -321,7 +321,10 @@ export class ApplicationStack extends cdk.Stack {
       entryPoint: ['/bin/sh', '-c'],
       command: [
         // Single string — the shell expands $VMAGENT_AUTH_PASSWORD then exec's vmagent.
+        // Seeds vector_relabel.yml if absent (user data only runs on first boot;
+        // service updates reuse the existing instance without re-running user data).
         [
+          '[ -f /etc/vmagent/vector_relabel.yml ] || printf \'- source_labels: [__name__]\\n  regex: .+:.+\\n  action: drop\\n\' > /etc/vmagent/vector_relabel.yml;',
           '/vmagent-prod',
           '--httpAuth.username=metrics',
           '--httpAuth.password=$VMAGENT_AUTH_PASSWORD',
