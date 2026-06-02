@@ -516,6 +516,7 @@ export class ApplicationStack extends cdk.Stack {
         GRAFANA_PASSWORD: 'admin',
         VMSELECT_ENDPOINT: 'http://vmselect.trickl.local:8481/select/0/prometheus/api/v1',
         YAML_PATH: '/mnt/vmagent/aggregations.yml',
+        DROP_LABEL_PATH: '/mnt/vmagent/relabel.yml',
         VMAGENT_URL: 'http://localhost:8429',
         OPENAI_MODEL: 'gpt-4.1-mini',
         // non-sensitive DB connection fields passed as plain env vars
