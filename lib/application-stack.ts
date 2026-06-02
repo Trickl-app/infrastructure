@@ -59,10 +59,22 @@ export class ApplicationStack extends cdk.Stack {
       description: 'Password senders must supply when pushing metrics to vmagent (HTTP basic auth).',
     });
 
+    const openAiApiKey = new cdk.CfnParameter(this, 'OpenAiApiKey', {
+      type: 'String',
+      noEcho: true,
+      description: 'OpenAI API key used by the Smart Metrics AI Investigator.',
+    });
+
     // Stored in Secrets Manager so it is never written in plaintext to the
     // task definition. ECS injects it as VMAGENT_AUTH_PASSWORD at container startup.
     const vmagentAuthSecret = new secretsmanager.Secret(this, 'VmagentAuthSecret', {
       secretStringValue: cdk.SecretValue.cfnParameter(vmagentAuthPassword),
+    });
+
+    // Stored separately from the vmagent auth secret so AI credentials can be
+    // rotated independently. ECS injects it as OPENAI_API_KEY at container startup.
+    const openAiApiKeySecret = new secretsmanager.Secret(this, 'OpenAiApiKeySecret', {
+      secretStringValue: cdk.SecretValue.cfnParameter(openAiApiKey),
     });
 
     // ── Cognito ───────────────────────────────────────────────────────────────
@@ -506,6 +518,7 @@ export class ApplicationStack extends cdk.Stack {
         VMSELECT_ENDPOINT: 'http://vmselect.trickl.local:8481/select/0/prometheus/api/v1',
         YAML_PATH: '/mnt/vmagent/aggregations.yml',
         VMAGENT_URL: 'http://localhost:8429',
+        OPENAI_MODEL: 'gpt-4.1-mini',
         // non-sensitive DB connection fields passed as plain env vars
         DB_HOST: props.rdsEndpoint,
         DB_PORT: '5432',
@@ -519,6 +532,7 @@ export class ApplicationStack extends cdk.Stack {
       secrets: {
         DB_USER: ecs.Secret.fromSecretsManager(props.dbSecret, 'username'),
         DB_PASSWORD: ecs.Secret.fromSecretsManager(props.dbSecret, 'password'),
+        OPENAI_API_KEY: ecs.Secret.fromSecretsManager(openAiApiKeySecret),
       },
       logging: ecs.LogDrivers.awsLogs({
         streamPrefix: 'smart-metrics',
