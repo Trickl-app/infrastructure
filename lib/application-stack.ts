@@ -228,6 +228,7 @@ export class ApplicationStack extends cdk.Stack {
     interfaceAsg.userData.addCommands(
       'mkdir -p /shared/vmagent',
       '[ -f /shared/vmagent/aggregations.yml ] || echo "[]" > /shared/vmagent/aggregations.yml',
+      '[ -f /shared/vmagent/relabel.yml ] || echo "[]" > /shared/vmagent/relabel.yml',
     );
 
     // EBS mount commands — run on every boot of the storage node.
@@ -319,20 +320,18 @@ export class ApplicationStack extends cdk.Stack {
       entryPoint: ['/bin/sh', '-c'],
       command: [
         // Single string — the shell expands $VMAGENT_AUTH_PASSWORD then exec's vmagent.
-        // FIX NEEDED on URL[1]: vmagent matches positional flags by occurrence count. Only one
-        // streamAggr.config is provided (for URL[0]), so vmagent reuses it for URL[1] too,
-        // causing vector to receive both raw and aggregated metrics. Fix by adding
-        // --remoteWrite.streamAggr.config= (empty string) before URL[1].
         [
           '/vmagent-prod',
           '--httpAuth.username=metrics',
           '--httpAuth.password=$VMAGENT_AUTH_PASSWORD',
           '--remoteWrite.tmpDataPath=/vmagentdata',
-          '-remoteWrite.url=http://localhost:8480/insert/0/prometheus',
+          // url[0]: vminsert receives only aggregated and relabeled metrics
+          '--remoteWrite.url=http://localhost:8480/insert/0/prometheus',
           '--remoteWrite.streamAggr.config=/etc/vmagent/aggregations.yml',
           '--remoteWrite.streamAggr.dropInput=true',
+          '--remoteWrite.relabelConfig=/etc/vmagent/relabel.yml',
+          // url[1]: vector receives raw metrics for S3 archival — no aggregation or relabeling
           '--remoteWrite.url=http://localhost:9090/',
-          '--remoteWrite.streamAggr.dropInput=false',
         ].join(' '),
       ],
       secrets: {
