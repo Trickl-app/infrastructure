@@ -103,7 +103,7 @@ Then deploy, supplying the four required parameters:
 npx cdk deploy --all \
   --parameters ApplicationStack:CertificateArn=YOUR_CERTIFICATE_ARN \
   --parameters ApplicationStack:DomainName=YOUR_DOMAIN \
-  --parameters ApplicationStack:VmagentAuthPassword=YOUR_CHOSEN_PASSWORD \
+  --parameters ApplicationStack:MetricsApiKey=YOUR_CHOSEN_API_KEY \
   --parameters ApplicationStack:OpenAiApiKey=YOUR_OPENAI_API_KEY
 ```
 
@@ -112,11 +112,11 @@ For example:
 npx cdk deploy --all \
   --parameters ApplicationStack:CertificateArn=arn:aws:acm:eu-west-1:123456789012:certificate/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx \
   --parameters ApplicationStack:DomainName=grafana.yourdomain.com \
-  --parameters ApplicationStack:VmagentAuthPassword=a-strong-password-here \
+  --parameters ApplicationStack:MetricsApiKey=a-strong-random-key-here \
   --parameters ApplicationStack:OpenAiApiKey=sk-your-openai-api-key
 ```
 
-`VmagentAuthPassword` is the password that any system pushing metrics to the pipeline must supply. Choose something strong — a random string of at least 20 characters is recommended. You will need to share this password with whoever configures the metric senders (see the Sending Metrics section below).
+`MetricsApiKey` is the API key that any system pushing metrics to the pipeline must supply as an `X-API-Key` header. Choose something strong — a random string of at least 20 characters is recommended. You will need to share this key with whoever configures the metric senders (see the Sending Metrics section below).
 
 `OpenAiApiKey` is used only by the smart-metrics backend for the AI Investigator. CDK stores it in Secrets Manager and injects it into the ECS task as `OPENAI_API_KEY`; it is not exposed to Grafana or the browser.
 
@@ -173,25 +173,30 @@ All future visits will use the session cookie set by the load balancer. The sess
 
 ## Sending metrics
 
-Metrics are pushed to vmagent over HTTPS on port 8429. The endpoint requires HTTP basic authentication using the `VmagentAuthPassword` you supplied at deploy time. The username is always `metrics`.
+Metrics are pushed to Vector over HTTPS on port 9090 using the OTLP/HTTP protocol. Every request must include the `X-API-Key` header set to the `MetricsApiKey` value you supplied at deploy time.
 
-### Prometheus / vmagent remote_write
+**Endpoint:** `https://YOUR_DOMAIN:9090/v1/metrics`
 
-Add the following to your Prometheus or vmagent configuration, replacing the placeholders with your values:
+### OpenTelemetry SDK (Node.js)
 
-```yaml
-remote_write:
-  - url: https://YOUR_DOMAIN:8429/api/v1/write
-    basic_auth:
-      username: metrics
-      password: YOUR_VMAGENT_AUTH_PASSWORD
+Configure your OTLP exporter with the endpoint and header:
+
+```javascript
+const { OTLPMetricExporter } = require('@opentelemetry/exporter-metrics-otlp-http');
+
+const exporter = new OTLPMetricExporter({
+  url: 'https://YOUR_DOMAIN:9090/v1/metrics',
+  headers: {
+    'X-API-Key': 'YOUR_METRICS_API_KEY',
+  },
+});
 ```
 
-### Other senders
+### Other OTLP senders
 
-Any tool that supports Prometheus remote write (e.g. Grafana Agent, OpenTelemetry Collector) follows the same pattern — set the remote write URL to `https://YOUR_DOMAIN:8429/api/v1/write` and supply the username `metrics` and your chosen password in the basic auth fields.
+Any tool that supports OTLP/HTTP (e.g. OpenTelemetry Collector, Grafana Alloy) follows the same pattern — set the OTLP endpoint to `https://YOUR_DOMAIN:9090/v1/metrics` and add `X-API-Key: YOUR_METRICS_API_KEY` as a custom header.
 
-If you need to rotate the password in future, redeploy the stack with a new `VmagentAuthPassword` value and update the configuration of all metric senders.
+If you need to rotate the key in future, redeploy the stack with a new `MetricsApiKey` value and update the configuration of all metric senders.
 
 ---
 
