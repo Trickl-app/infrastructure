@@ -12,6 +12,7 @@ import * as serviceDiscovery from 'aws-cdk-lib/aws-servicediscovery';
 import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import * as cognito from 'aws-cdk-lib/aws-cognito';
 import * as acm from 'aws-cdk-lib/aws-certificatemanager';
+import * as wafv2 from 'aws-cdk-lib/aws-wafv2';
 import { Construct } from 'constructs';
 
 // ------- COMPONENTS AND DESCRIPTIONS --------- //
@@ -57,6 +58,12 @@ export class ApplicationStack extends cdk.Stack {
       type: 'String',
       noEcho: true,
       description: 'OpenAI API key used by the Smart Metrics AI Investigator.',
+    });
+
+    const metricsApiKey = new cdk.CfnParameter(this, 'MetricsApiKey', {
+      type: 'String',
+      noEcho: true,
+      description: 'API key clients must supply as X-API-Key header when pushing metrics to the telemetry endpoint.',
     });
 
     // Stored separately so AI credentials can be
@@ -752,6 +759,78 @@ export class ApplicationStack extends cdk.Stack {
       containerPath: '/victoria-metrics-data',
       sourceVolume: 'vm-storage-data',
       readOnly: false,
+    });
+
+    // ── WAF ───────────────────────────────────────────────────────────────────
+    // Protects the metrics ingestion endpoint (/v1/metrics) with an API key.
+    // Rule 1 (priority 1): ALLOW requests to /v1/metrics that carry the correct X-API-Key header.
+    // Rule 2 (priority 2): BLOCK all remaining requests to /v1/metrics (no key or wrong key).
+    // Default action ALLOW is a fallback for traffic that matches no rule (e.g. Grafana on port 443).
+    const webAcl = new wafv2.CfnWebACL(this, 'TricklWebACL', {
+      defaultAction: { allow: {} },
+      scope: 'REGIONAL',
+      visibilityConfig: {
+        cloudWatchMetricsEnabled: true,
+        metricName: 'TricklWebACL',
+        sampledRequestsEnabled: true,
+      },
+      rules: [
+        {
+          name: 'AllowValidApiKey',
+          priority: 1,
+          action: { allow: {} },
+          statement: {
+            andStatement: {
+              statements: [
+                {
+                  byteMatchStatement: {
+                    fieldToMatch: { uriPath: {} },
+                    positionalConstraint: 'EXACTLY',
+                    searchString: '/v1/metrics',
+                    textTransformations: [{ priority: 0, type: 'NONE' }],
+                  },
+                },
+                {
+                  byteMatchStatement: {
+                    fieldToMatch: { singleHeader: { name: 'x-api-key' } },
+                    positionalConstraint: 'EXACTLY',
+                    searchString: metricsApiKey.valueAsString,
+                    textTransformations: [{ priority: 0, type: 'NONE' }],
+                  },
+                },
+              ],
+            },
+          },
+          visibilityConfig: {
+            cloudWatchMetricsEnabled: true,
+            metricName: 'AllowValidApiKey',
+            sampledRequestsEnabled: true,
+          },
+        },
+        {
+          name: 'BlockMetricsWithoutKey',
+          priority: 2,
+          action: { block: {} },
+          statement: {
+            byteMatchStatement: {
+              fieldToMatch: { uriPath: {} },
+              positionalConstraint: 'EXACTLY',
+              searchString: '/v1/metrics',
+              textTransformations: [{ priority: 0, type: 'NONE' }],
+            },
+          },
+          visibilityConfig: {
+            cloudWatchMetricsEnabled: true,
+            metricName: 'BlockMetricsWithoutKey',
+            sampledRequestsEnabled: true,
+          },
+        },
+      ],
+    });
+
+    new wafv2.CfnWebACLAssociation(this, 'WebACLAssociation', {
+      resourceArn: alb.loadBalancerArn,
+      webAclArn: webAcl.attrArn,
     });
 
     // ── Outputs ───────────────────────────────────────────────────────────────
