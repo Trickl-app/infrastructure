@@ -40,7 +40,7 @@ export class NetworkStack extends cdk.Stack {
       service: ec2.GatewayVpcEndpointAwsService.S3
     });
 
-    // ALB sits in the public subnet and receives inbound telemetry (8429) and Grafana (3000) from the internet.
+    // ALB sits in the public subnet and receives inbound telemetry (9090) and Grafana (443) from the internet.
     // allowAllOutbound false — we explicitly control where the ALB can send traffic.
     this.albSg = new ec2.SecurityGroup(this, 'AlbSg', {
       vpc: this.vpc,
@@ -68,14 +68,16 @@ export class NetworkStack extends cdk.Stack {
     // --------------- LOAD BALANCER RULES ---------------- //
 
     // Allow inbound telemetry data from the internet to reach the ALB (HTTPS).
-    this.albSg.addIngressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(8429));
+    this.albSg.addIngressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(9090));
     // Allow inbound HTTPS Grafana traffic from the internet.
     this.albSg.addIngressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(443));
     // Allow inbound HTTP so the ALB can issue HTTP→HTTPS redirects.
     this.albSg.addIngressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(80));
 
-    // Allow the ALB to forward telemetry traffic to the vmagent container.
-    this.albSg.addEgressRule(this.ecsSg, ec2.Port.tcp(8429));
+    // Allow the ALB to forward telemetry traffic to the vector container.
+    this.albSg.addEgressRule(this.ecsSg, ec2.Port.tcp(9090));
+    // Allow the ALB to health-check vector via its API port.
+    this.albSg.addEgressRule(this.ecsSg, ec2.Port.tcp(8686));
     // Allow the ALB to forward Grafana traffic to the Grafana container.
     this.albSg.addEgressRule(this.ecsSg, ec2.Port.tcp(3000));
     // Allow the ALB to call Cognito's token endpoint to complete the OIDC auth
@@ -84,8 +86,10 @@ export class NetworkStack extends cdk.Stack {
 
     // --------------- ECS RULES ---------------- //
 
-    // Allow vmagent to receive telemetry forwarded by the ALB.
-    this.ecsSg.addIngressRule(this.albSg, ec2.Port.tcp(8429));
+    // Allow vector to receive telemetry forwarded by the ALB.
+    this.ecsSg.addIngressRule(this.albSg, ec2.Port.tcp(9090));
+    // Allow the ALB to health-check vector on its API port.
+    this.ecsSg.addIngressRule(this.albSg, ec2.Port.tcp(8686));
     // Allow Grafana to receive dashboard traffic forwarded by the ALB.
     this.ecsSg.addIngressRule(this.albSg, ec2.Port.tcp(3000));
     // Allow cross node ecs traffic to the vmstorage write port; this is to insert data via vminsert

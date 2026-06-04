@@ -53,25 +53,13 @@ export class ApplicationStack extends cdk.Stack {
       description: 'The domain/subdomain pointing at this ALB (e.g. grafana.yourdomain.com). Used as the Cognito OIDC callback URL.',
     });
 
-    const vmagentAuthPassword = new cdk.CfnParameter(this, 'VmagentAuthPassword', {
-      type: 'String',
-      noEcho: true,
-      description: 'Password senders must supply when pushing metrics to vmagent (HTTP basic auth).',
-    });
-
     const openAiApiKey = new cdk.CfnParameter(this, 'OpenAiApiKey', {
       type: 'String',
       noEcho: true,
       description: 'OpenAI API key used by the Smart Metrics AI Investigator.',
     });
 
-    // Stored in Secrets Manager so it is never written in plaintext to the
-    // task definition. ECS injects it as VMAGENT_AUTH_PASSWORD at container startup.
-    const vmagentAuthSecret = new secretsmanager.Secret(this, 'VmagentAuthSecret', {
-      secretStringValue: cdk.SecretValue.cfnParameter(vmagentAuthPassword),
-    });
-
-    // Stored separately from the vmagent auth secret so AI credentials can be
+    // Stored separately so AI credentials can be
     // rotated independently. ECS injects it as OPENAI_API_KEY at container startup.
     const openAiApiKeySecret = new secretsmanager.Secret(this, 'OpenAiApiKeySecret', {
       secretStringValue: cdk.SecretValue.cfnParameter(openAiApiKey),
@@ -229,7 +217,6 @@ export class ApplicationStack extends cdk.Stack {
       'mkdir -p /shared/vmagent',
       '[ -f /shared/vmagent/aggregations.yml ] || echo "[]" > /shared/vmagent/aggregations.yml',
       '[ -f /shared/vmagent/relabel.yml ] || echo "[]" > /shared/vmagent/relabel.yml',
-      '[ -f /shared/vmagent/vector_relabel.yml ] || printf \'- source_labels: [__name__]\\n  regex: .+:.+\\n  action: drop\\n\' > /shared/vmagent/vector_relabel.yml',
     );
 
     // EBS mount commands — run on every boot of the storage node.
@@ -314,34 +301,12 @@ export class ApplicationStack extends cdk.Stack {
       image: ecs.ContainerImage.fromRegistry('victoriametrics/vmagent:latest'),
       memoryLimitMiB: 512,
       portMappings: [{ containerPort: 8429 }],
-      // entryPoint overrides the image's default entrypoint with a shell so that
-      // $VMAGENT_AUTH_PASSWORD (injected by ECS from Secrets Manager) is expanded
-      // before vmagent receives it as a flag value. Without a shell, the literal
-      // string "$VMAGENT_AUTH_PASSWORD" would be passed to vmagent unchanged.
-      entryPoint: ['/bin/sh', '-c'],
       command: [
-        // Single string — the shell expands $VMAGENT_AUTH_PASSWORD then exec's vmagent.
-        // Seeds vector_relabel.yml if absent (user data only runs on first boot;
-        // service updates reuse the existing instance without re-running user data).
-        [
-          '[ -f /etc/vmagent/vector_relabel.yml ] || printf \'- source_labels: [__name__]\\n  regex: .+:.+\\n  action: drop\\n\' > /etc/vmagent/vector_relabel.yml;',
-          '/vmagent-prod',
-          '--httpAuth.username=metrics',
-          '--httpAuth.password=$VMAGENT_AUTH_PASSWORD',
-          '--remoteWrite.tmpDataPath=/vmagentdata',
-          // url[0]: vminsert receives only aggregated and relabeled metrics
-          '--remoteWrite.url=http://localhost:8480/insert/0/prometheus',
-          '--remoteWrite.streamAggr.config=/etc/vmagent/aggregations.yml',
-          '--remoteWrite.streamAggr.dropInput=true',
-          '--remoteWrite.urlRelabelConfig=/etc/vmagent/relabel.yml',
-          // url[1]: vector receives raw metrics only — aggregated output (colon-suffixed) is dropped
-          '--remoteWrite.url=http://localhost:9090/',
-          '--remoteWrite.urlRelabelConfig=/etc/vmagent/vector_relabel.yml',
-        ].join(' '),
+        '--remoteWrite.tmpDataPath=/vmagentdata',
+        '--remoteWrite.url=http://localhost:8480/insert/0/prometheus',
+        '--remoteWrite.streamAggr.config=/etc/vmagent/aggregations.yml',
+        '--remoteWrite.urlRelabelConfig=/etc/vmagent/relabel.yml',
       ],
-      secrets: {
-        VMAGENT_AUTH_PASSWORD: ecs.Secret.fromSecretsManager(vmagentAuthSecret),
-      },
       logging: ecs.LogDrivers.awsLogs({
         streamPrefix: 'vm-agent',
         logGroup: new logs.LogGroup(this, 'VmAgentLogGroup', {
@@ -487,6 +452,7 @@ export class ApplicationStack extends cdk.Stack {
       // auth is handled by the IAM task role — no AWS credentials needed here.
       environment: {
         S3_BUCKET_NAME: props.metricsBucket.bucketName,
+        VMAGENT_ENDPOINT: 'http://localhost:8429/api/v1/write',
       },
       logging: ecs.LogDrivers.awsLogs({
         streamPrefix: 'vector',
@@ -523,7 +489,6 @@ export class ApplicationStack extends cdk.Stack {
         YAML_PATH: '/mnt/vmagent/aggregations.yml',
         DROP_LABEL_PATH: '/mnt/vmagent/relabel.yml',
         VMAGENT_URL: 'http://localhost:8429',
-        VMAGENT_AUTH_USERNAME: 'metrics',
         OPENAI_MODEL: 'gpt-4.1-mini',
         // non-sensitive DB connection fields passed as plain env vars
         DB_HOST: props.rdsEndpoint,
@@ -539,7 +504,6 @@ export class ApplicationStack extends cdk.Stack {
         DB_USER: ecs.Secret.fromSecretsManager(props.dbSecret, 'username'),
         DB_PASSWORD: ecs.Secret.fromSecretsManager(props.dbSecret, 'password'),
         OPENAI_API_KEY: ecs.Secret.fromSecretsManager(openAiApiKeySecret),
-        VMAGENT_AUTH_PASSWORD: ecs.Secret.fromSecretsManager(vmagentAuthSecret),
       },
       logging: ecs.LogDrivers.awsLogs({
         streamPrefix: 'smart-metrics',
@@ -723,20 +687,21 @@ export class ApplicationStack extends cdk.Stack {
     });
 
     const telemetryListener = alb.addListener('TelemetryListener', {
-      port: 8429,
+      port: 9090,
       protocol: elbv2.ApplicationProtocol.HTTPS,
       certificates: [certificate],
       open: false,
     });
-    telemetryListener.addTargets('VmAgentTarget', {
-      port: 8429,
+    telemetryListener.addTargets('VectorTarget', {
+      port: 9090,
       protocol: elbv2.ApplicationProtocol.HTTP,
-      targets: [vmAgentService.loadBalancerTarget({
-        containerName: 'VmAgentContainer',
-        containerPort: 8429,
+      targets: [vectorService.loadBalancerTarget({
+        containerName: 'VectorContainer',
+        containerPort: 9090,
       })],
       healthCheck: {
         path: '/health',
+        port: '8686',
         interval: cdk.Duration.seconds(30),
       },
     });
