@@ -60,16 +60,20 @@ export class ApplicationStack extends cdk.Stack {
       description: 'OpenAI API key used by the Smart Metrics AI Investigator.',
     });
 
-    const metricsApiKey = new cdk.CfnParameter(this, 'MetricsApiKey', {
-      type: 'String',
-      noEcho: true,
-      description: 'API key clients must supply as X-API-Key header when pushing metrics to the telemetry endpoint.',
-    });
-
     // Stored separately so AI credentials can be
     // rotated independently. ECS injects it as OPENAI_API_KEY at container startup.
     const openAiApiKeySecret = new secretsmanager.Secret(this, 'OpenAiApiKeySecret', {
       secretStringValue: cdk.SecretValue.cfnParameter(openAiApiKey),
+    });
+
+    // Auto-generated on first deploy. Rotate by updating the secret value in Secrets Manager
+    // then running `cdk deploy ApplicationStack` — no parameters needed.
+    const metricsApiKeySecret = new secretsmanager.Secret(this, 'MetricsApiKeySecret', {
+      description: 'API key for metrics ingestion endpoint (X-API-Key header)',
+      generateSecretString: {
+        excludePunctuation: true,
+        passwordLength: 32,
+      },
     });
 
     // ── Cognito ───────────────────────────────────────────────────────────────
@@ -794,7 +798,7 @@ export class ApplicationStack extends cdk.Stack {
                   byteMatchStatement: {
                     fieldToMatch: { singleHeader: { name: 'x-api-key' } },
                     positionalConstraint: 'EXACTLY',
-                    searchString: metricsApiKey.valueAsString,
+                    searchString: metricsApiKeySecret.secretValue.unsafeUnwrap(),
                     textTransformations: [{ priority: 0, type: 'NONE' }],
                   },
                 },
@@ -838,6 +842,11 @@ export class ApplicationStack extends cdk.Stack {
     new cdk.CfnOutput(this, 'AlbDnsName', {
       value: alb.loadBalancerDnsName,
       description: 'Point your domain DNS (CNAME or ALIAS) at this ALB address.',
+    });
+
+    new cdk.CfnOutput(this, 'MetricsApiKeySecretArn', {
+      value: metricsApiKeySecret.secretArn,
+      description: 'Secrets Manager ARN for the metrics ingestion API key. Retrieve the value here, and update it here to rotate.',
     });
   }
 }
