@@ -15,18 +15,6 @@ import * as acm from 'aws-cdk-lib/aws-certificatemanager';
 import * as wafv2 from 'aws-cdk-lib/aws-wafv2';
 import { Construct } from 'constructs';
 
-// ------- COMPONENTS AND DESCRIPTIONS --------- //
-
-// ECS Cluster:empty logical grouping tied to the VPC that containers will eventually run in.
-// Auto Scaling Group - the pool of EC2 instances the cluster runs containers on, with the second EBS volume attached.
-// User Data:boot commands that format and mount the EBS volume on the EC2 instance.
-// IAM Roles:permissions that allow ECS to pull images and write logs, and Lambda to run inside the VPC.
-// Task Definitions:blueprints describing how each container should be configured and run.
-// ECS Services:managers that keep a specified number of task instances running at all times, restarting on failure.
-// Application Load Balancer:public-facing entry point that receives traffic and forwards it to the correct container.
-// Lambda + EventBridge:scheduled function that reads from VictoriaMetrics and Grafana and writes results to RDS.
-// EBS Volume:persistent disk mounted into the VM Storage container to survive instance replacement.
-
 // defines the inputs this stack requires from NetworkStack.
 // extends cdk.StackProps so standard props like env are still accepted.
 interface ApplicationStackProps extends cdk.StackProps {
@@ -39,11 +27,10 @@ interface ApplicationStackProps extends cdk.StackProps {
 }
 
 export class ApplicationStack extends cdk.Stack {
-  // props is no longer optional:the VPC and security groups are required to deploy this stack.
   constructor(scope: Construct, id: string, props: ApplicationStackProps) {
     super(scope, id, props);
 
-    // ── Deploy-time parameters ────────────────────────────────────────────────
+    // cli parameters
     const certificateArn = new cdk.CfnParameter(this, 'CertificateArn', {
       type: 'String',
       description: 'ARN of an ACM certificate covering DomainName, used for HTTPS on the ALB.',
@@ -60,14 +47,12 @@ export class ApplicationStack extends cdk.Stack {
       description: 'OpenAI API key used by the Smart Metrics AI Investigator.',
     });
 
-    // Stored separately so AI credentials can be
-    // rotated independently. ECS injects it as OPENAI_API_KEY at container startup.
     const openAiApiKeySecret = new secretsmanager.Secret(this, 'OpenAiApiKeySecret', {
       secretStringValue: cdk.SecretValue.cfnParameter(openAiApiKey),
     });
 
     // Auto-generated on first deploy. Rotate by updating the secret value in Secrets Manager
-    // then running `cdk deploy ApplicationStack` — no parameters needed.
+    // then running redeploying this stack without parameters.
     const metricsApiKeySecret = new secretsmanager.Secret(this, 'MetricsApiKeySecret', {
       description: 'API key for metrics ingestion endpoint (X-API-Key header)',
       generateSecretString: {
@@ -76,8 +61,7 @@ export class ApplicationStack extends cdk.Stack {
       },
     });
 
-    // ── Cognito ───────────────────────────────────────────────────────────────
-    // Self-signup disabled — only admin-created users can authenticate.
+    // Cognito - requires admin to create users in aws console
     const userPool = new cognito.UserPool(this, 'UserPool', {
       selfSignUpEnabled: false,
       signInAliases: { email: true },
@@ -92,8 +76,6 @@ export class ApplicationStack extends cdk.Stack {
       removalPolicy: cdk.RemovalPolicy.DESTROY,
     });
 
-    // Domain prefix derived from account ID — globally unique without requiring
-    // a user-supplied parameter.
     const userPoolDomain = userPool.addDomain('CognitoDomain', {
       cognitoDomain: {
         domainPrefix: `trickl-${cdk.Aws.ACCOUNT_ID}`,
@@ -112,45 +94,28 @@ export class ApplicationStack extends cdk.Stack {
 
     const certificate = acm.Certificate.fromCertificateArn(this, 'Certificate', certificateArn.valueAsString);
 
-    // ── ECR ───────────────────────────────────────────────────────────────────
-    // repositories to store images for pulldown on new container creation. They are pushed to the their
-    // respective ECR repo on every new deploy of ECS. 
-    // we do not need this until we have custom images, which we do not yet. 
-    // const vmAgentRepo = new ecr.Repository(this, 'VmAgentRepository');
-    // const vmInsertRepo = new ecr.Repository(this, 'VmInsertRepository');
-    // const vmSelectRepo = new ecr.Repository(this, 'VmSelectRepository');
-    // const vmStorageRepo = new ecr.Repository(this, 'VmStorageRepository');
-    // const grafanaRepo = new ecr.Repository(this, 'GrafanaRepository');
-
     // ── ECS Cluster ───────────────────────────────────────────────────────────
-    // Just the shell. Will need to run .addCapacity to acutally add compute. 
     const cluster = new ecs.Cluster(this, 'TricklCluster', {
       vpc: props.vpc,
     });
 
     // ── EC2 Auto Scaling Groups + Capacity Providers ──────────────────────────
-    //
+
     // Each node gets its own ASG and a named capacity provider.
-    //
-    // Why explicit AutoScalingGroup instead of cluster.addCapacity()?
-    // cluster.addCapacity() creates a capacity provider internally but returns
-    // only the ASG — you get no reference to the provider. Services need to
-    // reference a named capacity provider to pin themselves to a specific node,
-    // so we create the provider explicitly and hold onto it.
-    //
+  
+    // Services need to reference a named capacity provider to pin themselves to a specific node
+    // so we create the provider explicitly instead of just adding capacity to the cluster
+
     // Why EcsOptimizedImage?
     // Without it the EC2 instance boots as a plain Amazon Linux box with no ECS
     // agent. EcsOptimizedImage.amazonLinux2() bakes the agent in so the instance
     // registers with the cluster automatically on first boot.
 
-    // ── Interface Node ────────────────────────────────────────────────────────
-    // Hosts: vmagent, vminsert, vector, grafana, smart-metrics.
-    // vmagent, vminsert, and grafana have low continuous resource usage.
-    // Vector handles the full raw metric stream and is the baseline sizing driver.
-    // Smart-metrics is mostly idle but fires a demanding cron job every 24h
-    // (API scraping, data sorting) lasting a couple of minutes — size the instance
-    // to absorb that burst without starving the other services.
-    // No AZ constraint — no EBS on this node.
+    // Interface Node
+    // Hosts: vmagent, vminsert, vector, grafana, smart-metrics
+    // Vector handles the full raw metric stream and is the baseline sizing driver
+    // Smart-metrics is mostly idle
+    // No AZ constraint because no EBS volume
     const interfaceAsg = new autoscaling.AutoScalingGroup(this, 'InterfaceASG', {
       instanceType: ec2.InstanceType.of(ec2.InstanceClass.T3, ec2.InstanceSize.MEDIUM),
       machineImage: ecs.EcsOptimizedImage.amazonLinux2(),
@@ -168,10 +133,10 @@ export class ApplicationStack extends cdk.Stack {
     cluster.addAsgCapacityProvider(interfaceCP);
 
     // ── Select Node ───────────────────────────────────────────────────────────
-    // Hosts: vmselect only.
+    // Hosts: vmselect only
     // Query processing is CPU/memory intensive per query but does no persistent I/O.
-    // t3.small is the starting point; vertically scale as dashboard load grows.
-    // No AZ constraint — no EBS on this node.
+    // t3.small is the starting point; vertically scale as dashboard load grows; potentially horizontally scale if you need it
+    // No AZ constraint again
     const selectAsg = new autoscaling.AutoScalingGroup(this, 'SelectASG', {
       instanceType: ec2.InstanceType.of(ec2.InstanceClass.T3, ec2.InstanceSize.SMALL),
       machineImage: ecs.EcsOptimizedImage.amazonLinux2(),
@@ -190,11 +155,9 @@ export class ApplicationStack extends cdk.Stack {
 
     // ── Storage Node ──────────────────────────────────────────────────────────
     // Hosts: vmstorage only.
-    // Pinned to privateSubnets[0] — EBS volumes are AZ-specific, so the instance
-    // and its data volume must always land in the same AZ. Changing this subnet
-    // would cause the new instance to boot in a different AZ from the EBS volume,
-    // making the data inaccessible.
+    // Pinned to privateSubnets[0] — EBS volumes are AZ-specific
     // deleteOnTermination: false ensures the data volume outlives instance replacement.
+    // set to 50gb; should store somewhere between 50 and 100 billion samples a month depending on victoriametrics compression
     const storageAsg = new autoscaling.AutoScalingGroup(this, 'StorageASG', {
       instanceType: ec2.InstanceType.of(ec2.InstanceClass.T3, ec2.InstanceSize.MEDIUM),
       machineImage: ecs.EcsOptimizedImage.amazonLinux2(),
@@ -219,11 +182,10 @@ export class ApplicationStack extends cdk.Stack {
     cluster.addAsgCapacityProvider(storageCP);
 
     // Interface node bootstrap — run on every boot.
-    // Creates the shared vmagent config directory and seeds a valid empty
+    // Creates the shared vmagent config directory and a valid empty
     // aggregations.yml so vmagent can start before smart-metrics has written
-    // its first real config. Smart-metrics overwrites this file on its first
-    // cron run and signals vmagent to hot-reload.
-    // -n flag: only write the file if it doesn't already exist (idempotent on reboot).
+    // its first real config. Smart-metrics overwrites this file
+    // -n flag: only write the file if it doesn't already exist in case of reboot
     interfaceAsg.userData.addCommands(
       'mkdir -p /shared/vmagent',
       '[ -f /shared/vmagent/aggregations.yml ] || echo "[]" > /shared/vmagent/aggregations.yml',
@@ -258,16 +220,14 @@ export class ApplicationStack extends cdk.Stack {
 
     // Vector's task role — distinct from the execution role.
     // The execution role lets ECS pull images and write CloudWatch logs.
-    // The task role is what the running Vector container uses to call AWS APIs,
-    // specifically writing raw metrics to the S3 bucket.
+    // The task role is what the running Vector container uses to call AWS APIs
+    // so it can write metrics to the S3 bucket
     const vectorTaskRole = new iam.Role(this, 'VectorTaskRole', {
       assumedBy: new iam.ServicePrincipal('ecs-tasks.amazonaws.com'),
     });
     props.metricsBucket.grantWrite(vectorTaskRole);
-    // grantWrite only covers object-level actions (PutObject etc. on bucket/*).
     // Vector's S3 sink healthcheck calls HeadBucket, which requires s3:ListBucket
-    // on the bucket ARN itself — without it Vector logs "Invalid credentials" and
-    // refuses to start writing. Grant it explicitly on the bucket ARN here.
+    // on the bucket ARN itself
     vectorTaskRole.addToPrincipalPolicy(new iam.PolicyStatement({
       actions: ['s3:ListBucket'],
       resources: [props.metricsBucket.bucketArn],
@@ -421,7 +381,7 @@ export class ApplicationStack extends cdk.Stack {
       portMappings: [{ containerPort: 3000 }],
       environment: {
         GF_SECURITY_ADMIN_USER: 'admin',
-        // TODO pre-prod: move to Secrets Manager
+        // doesn't matter since login is verified by cognito; but we could move to secret's manager
         GF_SECURITY_ADMIN_PASSWORD: 'admin',
         // HOST mode: Grafana and smart-metrics share the EC2 network namespace,
         // so localhost:3001 resolves correctly. docker-compose uses the service
@@ -429,7 +389,7 @@ export class ApplicationStack extends cdk.Stack {
         SMART_METRICS_INTERNAL_URL: 'http://localhost:3001',
         // ALB auth proxy — Grafana trusts the identity header set by the ALB
         // after OIDC authentication, auto-signing users in without a second
-        // Grafana login prompt.
+        // Grafana login prompt; which is why we don't care the password is store above as plaintext; it's never used.
         GF_AUTH_PROXY_ENABLED: 'true',
         GF_AUTH_PROXY_HEADER_NAME: 'X-Amzn-Oidc-Identity',
         GF_AUTH_PROXY_HEADER_PROPERTY: 'username',

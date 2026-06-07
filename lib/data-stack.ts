@@ -20,15 +20,13 @@ export class DataStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props: DataStackProps) {
     super(scope, id, props);
 
-    // S3 bucket for raw metrics archive written by Vector.
-    // RETAIN ensures the bucket and its data survive stack teardowns.
+    // got retain on for longevity after a stack teardown
     this.metricsBucket = new s3.Bucket(this, 'MetricsBucket', {
       encryption: s3.BucketEncryption.S3_MANAGED,
       blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
       removalPolicy: cdk.RemovalPolicy.RETAIN,
     });
 
-    // new rds instance
     const db = new rds.DatabaseInstance(this, 'Database', {
       engine: rds.DatabaseInstanceEngine.postgres({
         version: rds.PostgresEngineVersion.VER_15,
@@ -40,16 +38,12 @@ export class DataStack extends cdk.Stack {
       multiAz: false,
       allocatedStorage: 20,
       deletionProtection: true,
-      // auto-generates a username/password and stores them in Secrets Manager.
-      // smart-metrics reads DB_USER and DB_PASSWORD from the secret at runtime.
+      // this isn't the password, we're just generating it here
       credentials: rds.Credentials.fromGeneratedSecret('trickl'),
-      // explicit db name so smart-metrics can reference it as a known constant.
       databaseName: 'trickl',
     });
 
-    // rds endpoint and secret made public for ApplicationStack to consume
     this.rdsEndpoint = db.instanceEndpoint.hostname;
-    // db.secret is always defined when using fromGeneratedSecret
     this.dbSecret = db.secret!;
   }
 }
