@@ -38,11 +38,20 @@ test('ALB security group allows inbound on port 8429 from the internet', () => {
   });
 });
 
-// confirms Grafana dashboards are publicly accessible via the ALB
-test('ALB security group allows inbound on port 3000 from the internet', () => {
+// confirms Grafana is accessible over HTTPS via the ALB
+test('ALB security group allows inbound on port 443 from the internet', () => {
   template.hasResourceProperties('AWS::EC2::SecurityGroup', {
     SecurityGroupIngress: Match.arrayWith([
-      Match.objectLike({ FromPort: 3000, ToPort: 3000, CidrIp: '0.0.0.0/0', IpProtocol: 'tcp' }),
+      Match.objectLike({ FromPort: 443, ToPort: 443, CidrIp: '0.0.0.0/0', IpProtocol: 'tcp' }),
+    ]),
+  });
+});
+
+// confirms HTTP traffic is accepted so the ALB can issue HTTP→HTTPS redirects
+test('ALB security group allows inbound on port 80 from the internet', () => {
+  template.hasResourceProperties('AWS::EC2::SecurityGroup', {
+    SecurityGroupIngress: Match.arrayWith([
+      Match.objectLike({ FromPort: 80, ToPort: 80, CidrIp: '0.0.0.0/0', IpProtocol: 'tcp' }),
     ]),
   });
 });

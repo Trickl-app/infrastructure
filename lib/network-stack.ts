@@ -3,8 +3,7 @@ import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import { Construct } from 'constructs';
 
 export class NetworkStack extends cdk.Stack {
-  // public properties allow other stacks to reference these resources via props. Necessary for VPC to be
-  // accessed within the application stack. 
+  // they have to be public for the other stacks (mainly application) to access
   public readonly vpc: ec2.Vpc;
   public readonly albSg: ec2.SecurityGroup;
   public readonly ecsSg: ec2.SecurityGroup;
@@ -13,21 +12,17 @@ export class NetworkStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, props);
 
-
     this.vpc = new ec2.Vpc(this, 'Vpc', {
-      // 2 AZs: satisfies RDS subnet group requirement. ASG is pinned to privateSubnets[0] so EBS stays in AZ1.
+      // need 2 for rds but we're really just going to use subnet[0] for our nodes
       maxAzs: 2,
       natGateways: 1,
       subnetConfiguration: [
         {
-          //public subnets
           name: 'Public',
           subnetType: ec2.SubnetType.PUBLIC,
-          // leaving as default
           cidrMask: 24,
         },
         {
-          //private subnets
           name: 'Private',
           subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS,
           cidrMask: 24,
@@ -40,62 +35,59 @@ export class NetworkStack extends cdk.Stack {
       service: ec2.GatewayVpcEndpointAwsService.S3
     });
 
-    // ALB sits in the public subnet and receives inbound telemetry (8429) and Grafana (3000) from the internet.
-    // allowAllOutbound false — we explicitly control where the ALB can send traffic.
     this.albSg = new ec2.SecurityGroup(this, 'AlbSg', {
       vpc: this.vpc,
       description: "Security group for Application Load Balancer",
       allowAllOutbound: false,
     });
 
-    // ECS tasks sit in the private subnet. Only the ALB can initiate inbound connections.
-    // allowAllOutbound false — we explicitly control outbound to RDS.
+
     this.ecsSg = new ec2.SecurityGroup(this, 'EcsSg', {
       vpc: this.vpc,
       description: "Security group for ECS tasks",
       allowAllOutbound: false,
     });
 
-    // RDS sits in the private subnet. Only ECS tasks can connect on the Postgres port; though we only care about
-    // the interface node being able to do so.
-    // No outbound needed — RDS never initiates connections, resources connect to it.
     this.rdsSg = new ec2.SecurityGroup(this, 'RdsSg', {
       vpc: this.vpc,
       description: "Security group for RDS Postgres instance",
       allowAllOutbound: false,
     });
 
-    // --------------- LOAD BALANCER RULES ---------------- //
+    //LOAD BALANCER
 
-    // Allow inbound telemetry data from the internet to reach the ALB.
-    this.albSg.addIngressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(8429));
-    // Allow inbound Grafana dashboard traffic from the internet to reach the ALB.
-    this.albSg.addIngressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(3000));
+    // Allow inbound metrics from the internet to reach alb; use waf in app stack to confirm permissions
+    this.albSg.addIngressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(9090));
+    // Allow inbound HTTPS Grafana traffic
+    this.albSg.addIngressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(443));
+    // HTTP to HTTPS
+    this.albSg.addIngressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(80));
 
-    // Allow the ALB to forward telemetry traffic onwards to the vmagent ECS container.
-    this.albSg.addEgressRule(this.ecsSg, ec2.Port.tcp(8429));
-    // Allow the ALB to forward Grafana traffic onwards to the Grafana ECS container.
+    // alb to vector
+    this.albSg.addEgressRule(this.ecsSg, ec2.Port.tcp(9090));
+    // alb health checks vector on this port because vector's health check is dependent on an api located here
+    this.albSg.addEgressRule(this.ecsSg, ec2.Port.tcp(8686));
+    // alb to grafana
     this.albSg.addEgressRule(this.ecsSg, ec2.Port.tcp(3000));
-    // Allow inbound smart-metrics API traffic from the internet to reach the ALB.
-    this.albSg.addIngressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(3001));
-    // Allow the ALB to forward smart-metrics API traffic to the smart-metrics container.
-    this.albSg.addEgressRule(this.ecsSg, ec2.Port.tcp(3001));
+    // Allow alb to call Cognito's token endpoint to complete OIDC auth.
+    // Required because allowAllOutbound is false
+    this.albSg.addEgressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(443));
 
-    // --------------- ECS RULES ---------------- //
+    //ECS RULES
 
-    // Allow vmagent to receive telemetry forwarded by the ALB.
-    this.ecsSg.addIngressRule(this.albSg, ec2.Port.tcp(8429));
-    // Allow Grafana to receive dashboard traffic forwarded by the ALB.
+
+    this.ecsSg.addIngressRule(this.albSg, ec2.Port.tcp(9090));
+
+    this.ecsSg.addIngressRule(this.albSg, ec2.Port.tcp(8686));
+
     this.ecsSg.addIngressRule(this.albSg, ec2.Port.tcp(3000));
-    // Allow smart-metrics to receive API traffic forwarded by the ALB.
-    this.ecsSg.addIngressRule(this.albSg, ec2.Port.tcp(3001));
-    // Allow cross node ecs traffic to the vmstorage write port; this is to insert data via vminsert
+    // cross node traffic to vmstorage's write port
     this.ecsSg.addIngressRule(this.ecsSg, ec2.Port.tcp(8400));
     // As above but for the read node; this is so vmselect can query.
     this.ecsSg.addIngressRule(this.ecsSg, ec2.Port.tcp(8401));
     // As above but for vmselect; this is so grafana can forward queries to vmselect.
     this.ecsSg.addIngressRule(this.ecsSg, ec2.Port.tcp(8481));
-    // =========== egress rules ============
+    // egress rules
     // Allow cross node ecs traffic to the vmstorage write port; this is to insert data via vminsert
     this.ecsSg.addEgressRule(this.ecsSg, ec2.Port.tcp(8400));
     // As above but for the read node; this is so vmselect can query.
@@ -109,7 +101,7 @@ export class NetworkStack extends cdk.Stack {
     // Allow EC2 instances to resolve hostnames via the VPC DNS resolver.
     this.ecsSg.addEgressRule(ec2.Peer.anyIpv4(), ec2.Port.udp(53));
 
-    // --------------- RDS RULES ---------------- //
+    //RDS RULES
 
     // Allow EC2 node to write recommendations to Postgres.
     this.rdsSg.addIngressRule(this.ecsSg, ec2.Port.tcp(5432));

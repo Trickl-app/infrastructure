@@ -1,17 +1,237 @@
-# Welcome to your CDK TypeScript project
+# Metropolis Infrastructure — Deployment Guide
 
-This is a blank project for CDK development with TypeScript.
+This CDK stack deploys the full Metropolis metrics pipeline on AWS: VictoriaMetrics cluster, Grafana, vmagent, Vector, smart-metrics, and RDS Postgres — all behind an HTTPS Application Load Balancer with Cognito OIDC authentication.
 
-The `cdk.json` file tells the CDK Toolkit how to execute your app.
+---
 
-## Useful commands
+## Prerequisites
 
-* `npm run build`   compile typescript to js
-* `npm run watch`   watch for changes and compile
-* `npm run test`    perform the jest unit tests
-* `npx cdk deploy`  deploy this stack to your default AWS account/region
-* `npx cdk diff`    compare deployed stack with current state
-* `npx cdk synth`   emits the synthesized CloudFormation template
+Before deploying, make sure you have the following installed and configured on your machine.
 
-Hello.
-Hello from Jonny
+### 1. Node.js and npm
+
+Download and install Node.js (version 18 or higher) from https://nodejs.org. npm is included with Node.js.
+
+Verify the installation:
+```bash
+node --version
+npm --version
+```
+
+### 2. AWS CLI
+
+The AWS CLI lets your machine communicate with your AWS account.
+
+Install it by following the guide for your operating system:
+https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html
+
+Once installed, configure it with your AWS credentials:
+```bash
+aws configure
+```
+
+You will be prompted for:
+- **AWS Access Key ID** — found in the AWS Console under IAM → Users → your user → Security credentials
+- **AWS Secret Access Key** — generated at the same time as the Access Key ID
+- **Default region name** — the AWS region you want to deploy to, e.g. `eu-west-1` for Ireland or `us-east-1` for US East
+- **Default output format** — enter `json`
+
+### 3. AWS CDK
+
+```bash
+npm install -g aws-cdk
+```
+
+Verify:
+```bash
+cdk --version
+```
+
+### 4. A domain name
+
+You need a domain name (or subdomain) to point at the load balancer. For example: `grafana.yourdomain.com`. This is required for HTTPS and for the Cognito login page to redirect back correctly after authentication.
+
+---
+
+## Step 1 — Create an ACM Certificate
+
+AWS Certificate Manager (ACM) provides free HTTPS certificates for domains you own. The certificate must be created in the **same AWS region** you are deploying to.
+
+1. Go to the **AWS Console** → search for **Certificate Manager** → open it
+2. Click **Request a certificate**
+3. Choose **Request a public certificate** and click Next
+4. Under **Fully qualified domain name**, enter the subdomain you plan to use, e.g. `grafana.yourdomain.com`
+5. Under **Validation method**, choose **DNS validation**
+6. Click **Request**
+
+You will be taken to the certificate detail page. Its status will be **Pending validation**.
+
+7. Click into the certificate. Under **Domains**, you will see a **CNAME name** and a **CNAME value**
+8. Log in to your domain registrar and add a new **CNAME record** with those exact values. The process varies by registrar but all registrars support CNAME records — look for a "DNS management" or "DNS records" section
+9. Return to ACM and wait. Validation typically takes 5–30 minutes. Refresh the page until the status shows **Issued**
+10. Once issued, copy the **Certificate ARN** — it looks like `arn:aws:acm:eu-west-1:123456789012:certificate/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`. You will need this in Step 3
+
+---
+
+## Step 2 — Bootstrap CDK (first time only)
+
+CDK needs to provision some resources in your AWS account before it can deploy stacks. This is a one-time setup per account and region:
+
+```bash
+cdk bootstrap aws://YOUR_ACCOUNT_ID/YOUR_REGION
+```
+
+Replace `YOUR_ACCOUNT_ID` with your 12-digit AWS account ID (found top-right in the AWS Console) and `YOUR_REGION` with your chosen region, e.g.:
+
+```bash
+cdk bootstrap aws://123456789012/eu-west-1
+```
+
+---
+
+## Step 3 — Install dependencies and deploy
+
+From the `infrastructure/` directory:
+
+```bash
+npm install
+```
+
+Then deploy, supplying the three required parameters:
+
+```bash
+npx cdk deploy --all \
+  --parameters ApplicationStack:CertificateArn=YOUR_CERTIFICATE_ARN \
+  --parameters ApplicationStack:DomainName=YOUR_DOMAIN \
+  --parameters ApplicationStack:OpenAiApiKey=YOUR_OPENAI_API_KEY
+```
+
+For example:
+```bash
+npx cdk deploy --all \
+  --parameters ApplicationStack:CertificateArn=arn:aws:acm:eu-west-1:123456789012:certificate/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx \
+  --parameters ApplicationStack:DomainName=grafana.yourdomain.com \
+  --parameters ApplicationStack:OpenAiApiKey=sk-your-openai-api-key
+```
+
+`OpenAiApiKey` is used only by the smart-metrics backend for the AI Investigator. CDK stores it in Secrets Manager and injects it into the ECS task as `OPENAI_API_KEY`; it is not exposed to Grafana or the browser.
+
+The metrics ingestion API key (`MetricsApiKey`) is auto-generated by AWS on first deploy and stored in Secrets Manager. After deployment completes, retrieve it from the ARN printed in the `MetricsApiKeySecretArn` stack output (see Sending Metrics below).
+
+CDK will show you a summary of the changes and ask for confirmation before creating any resources. Type `y` to proceed.
+
+Deployment takes approximately 10–15 minutes.
+
+---
+
+## Step 4 — Point your DNS at the load balancer
+
+Once deployment completes, CDK prints the stack outputs. Look for `AlbDnsName` — it will look something like:
+
+```
+Outputs:
+ApplicationStack.AlbDnsName = Metropolis-ALB-1234567890.eu-west-1.elb.amazonaws.com
+```
+
+Go back to your domain registrar's DNS management page and add a **CNAME record**:
+
+| Name | Type | Value |
+|---|---|---|
+| `grafana` (or whatever subdomain you chose) | CNAME | the ALB DNS name from above |
+
+DNS propagation usually takes a few minutes but can take up to an hour depending on your registrar.
+
+---
+
+## Step 5 — Create your first user
+
+The Cognito User Pool is configured with self-signup disabled — users must be created by an administrator.
+
+1. Go to the **AWS Console** → search for **Cognito** → open it
+2. Click on **User pools** and select the pool named `UserPool` (inside the `ApplicationStack`)
+3. Click **Create user**
+4. Enter the user's email address. Leave **Send an invitation** checked
+5. Click **Create user**
+
+The user will receive an email from AWS Cognito with a temporary password.
+
+---
+
+## Step 6 — First login
+
+1. Visit your domain in a browser, e.g. `https://grafana.yourdomain.com`
+2. The load balancer redirects you to the Cognito hosted login page
+3. Enter the email address and the temporary password from the invitation email
+4. Cognito will prompt you to set a new permanent password
+5. After setting the password you are redirected back to Grafana and signed in automatically — no second login prompt
+
+All future visits will use the session cookie set by the load balancer. The session lasts 7 days before requiring re-authentication.
+
+---
+
+## Sending metrics
+
+Metrics are pushed to Vector over HTTPS on port 9090 using the OTLP/HTTP protocol. Every request must include the `X-API-Key` header set to the auto-generated metrics API key.
+
+**Endpoint:** `https://YOUR_DOMAIN:9090/v1/metrics`
+
+### Retrieving the API key
+
+After deployment, the `MetricsApiKeySecretArn` stack output contains the Secrets Manager ARN for the key. Retrieve the value via the AWS CLI:
+
+```bash
+aws secretsmanager get-secret-value \
+  --secret-id YOUR_SECRET_ARN \
+  --query SecretString \
+  --output text
+```
+
+Or go to **AWS Console → Secrets Manager**, find the secret by the ARN, and click **Retrieve secret value**.
+
+### Rotating the API key
+
+1. Go to **AWS Console → Secrets Manager** → open the secret at `MetricsApiKeySecretArn`
+2. Click **Retrieve secret value** → **Edit** → enter the new key → **Save**
+3. Redeploy to sync the new value into the WAF rule:
+   ```bash
+   npx cdk deploy ApplicationStack
+   ```
+   No parameters needed — CDK re-resolves the secret automatically.
+4. Update the key in all metric senders.
+
+### OpenTelemetry SDK (Node.js)
+
+Configure your OTLP exporter with the endpoint and header:
+
+```javascript
+const { OTLPMetricExporter } = require('@opentelemetry/exporter-metrics-otlp-http');
+
+const exporter = new OTLPMetricExporter({
+  url: 'https://YOUR_DOMAIN:9090/v1/metrics',
+  headers: {
+    'X-API-Key': 'YOUR_METRICS_API_KEY',
+  },
+});
+```
+
+### Other OTLP senders
+
+Any tool that supports OTLP/HTTP (e.g. OpenTelemetry Collector, Grafana Alloy) follows the same pattern — set the OTLP endpoint to `https://YOUR_DOMAIN:9090/v1/metrics` and add `X-API-Key: YOUR_METRICS_API_KEY` as a custom header.
+
+If you need to rotate the key in future, redeploy the stack with a new `MetricsApiKey` value and update the configuration of all metric senders.
+
+---
+
+## Known gaps and future improvements
+
+### Grafana dashboard persistence
+
+Grafana currently uses SQLite as its internal database, which lives inside the container filesystem. Any dashboards, alert rules, or preferences created through the UI are wiped on every container restart or EC2 instance replacement.
+
+**Recommended fix:** configure Grafana to use the existing RDS Postgres instance as its backend database instead of SQLite. Grafana has native PostgreSQL support and stores all user-created content there. Since RDS already has automated backups and survives container and instance lifecycle events, the Grafana container becomes fully stateless and all user data is durable. No additional EBS volumes are needed.
+
+### vmagent config file persistence
+
+`aggregations.yml` and `relabel.yml` are written by smart-metrics to `/shared/vmagent/` on the interface EC2 instance's local storage. If the EC2 instance is replaced, these files are lost and seeded as empty `[]`. Since smart-metrics operates as a request-response service (not a cron job), the files are only regenerated when an HTTP request triggers a rewrite — meaning vmagent could operate without the correct aggregation and relabel configuration indefinitely until that happens.
+
+**Recommended fix:** persist the YAML content to the existing RDS Postgres instance. Since smart-metrics already holds a database connection, it can store the config in a table and restore from it on startup before serving any requests. This makes recovery automatic and immediate on instance replacement, with no dependency on incoming traffic.
