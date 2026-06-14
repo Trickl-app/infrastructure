@@ -219,19 +219,3 @@ const exporter = new OTLPMetricExporter({
 Any tool that supports OTLP/HTTP (e.g. OpenTelemetry Collector, Grafana Alloy) follows the same pattern — set the OTLP endpoint to `https://YOUR_DOMAIN:9090/v1/metrics` and add `X-API-Key: YOUR_METRICS_API_KEY` as a custom header.
 
 If you need to rotate the key in future, redeploy the stack with a new `MetricsApiKey` value and update the configuration of all metric senders.
-
----
-
-## Known gaps and future improvements
-
-### Grafana dashboard persistence
-
-Grafana currently uses SQLite as its internal database, which lives inside the container filesystem. Any dashboards, alert rules, or preferences created through the UI are wiped on every container restart or EC2 instance replacement.
-
-**Recommended fix:** configure Grafana to use the existing RDS Postgres instance as its backend database instead of SQLite. Grafana has native PostgreSQL support and stores all user-created content there. Since RDS already has automated backups and survives container and instance lifecycle events, the Grafana container becomes fully stateless and all user data is durable. No additional EBS volumes are needed.
-
-### vmagent config file persistence
-
-`aggregations.yml` and `relabel.yml` are written by smart-metrics to `/shared/vmagent/` on the interface EC2 instance's local storage. If the EC2 instance is replaced, these files are lost and seeded as empty `[]`. Since smart-metrics operates as a request-response service (not a cron job), the files are only regenerated when an HTTP request triggers a rewrite — meaning vmagent could operate without the correct aggregation and relabel configuration indefinitely until that happens.
-
-**Recommended fix:** persist the YAML content to the existing RDS Postgres instance. Since smart-metrics already holds a database connection, it can store the config in a table and restore from it on startup before serving any requests. This makes recovery automatic and immediate on instance replacement, with no dependency on incoming traffic.
