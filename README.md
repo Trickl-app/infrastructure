@@ -1,18 +1,17 @@
-# Metropolis Infrastructure — Deployment Guide
 
-This CDK stack deploys the full Metropolis metrics pipeline on AWS: VictoriaMetrics cluster, Grafana, vmagent, Vector, smart-metrics, and RDS Postgres — all behind an HTTPS Application Load Balancer with Cognito OIDC authentication.
+This CDK stack deploys the Trickl metrics pipeline on AWS. It builds up a VictoriaMetrics cluster, Grafana, vmagent, Vector, smart-metrics, and RDS Postgres — all sat behind an HTTPS Application Load Balancer. Grafana login goes through Cognito OIDC; inbound metrics are gated by a WAF API key.
 
+The best way to install this is to use Trickl's dedicated CLI tool, which will abstract much of this away for you, though you'll still need to login to AWS CLI beforehand, as well as have your ACM certificate for your domain.
 ---
 
 ## Prerequisites
 
-Before deploying, make sure you have the following installed and configured on your machine.
+You'll need a few things installed before you can deploy.
 
 ### 1. Node.js and npm
 
-Download and install Node.js (version 18 or higher) from https://nodejs.org. npm is included with Node.js.
+Install Node.js 18+ from https://nodejs.org — npm comes with it.
 
-Verify the installation:
 ```bash
 node --version
 npm --version
@@ -20,68 +19,62 @@ npm --version
 
 ### 2. AWS CLI
 
-The AWS CLI lets your machine communicate with your AWS account.
+The CLI lets your machine talk to your AWS account.
 
-Install it by following the guide for your operating system:
-https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html
+Follow the install guide for your OS: https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html
 
-Once installed, configure it with your AWS credentials:
+Then configure it:
 ```bash
 aws configure
 ```
 
-You will be prompted for:
-- **AWS Access Key ID** — found in the AWS Console under IAM → Users → your user → Security credentials
-- **AWS Secret Access Key** — generated at the same time as the Access Key ID
-- **Default region name** — the AWS region you want to deploy to, e.g. `eu-west-1` for Ireland or `us-east-1` for US East
-- **Default output format** — enter `json`
+You'll be asked for:
+- **AWS Access Key ID** — find it in the AWS Console under IAM → Users → your user → Security credentials
+- **AWS Secret Access Key** — generated alongside the Access Key ID
+- **Default region name** — e.g. `eu-west-1` for Ireland or `us-east-1` for US East
+- **Default output format** — `json`
 
 ### 3. AWS CDK
 
 ```bash
 npm install -g aws-cdk
-```
-
-Verify:
-```bash
 cdk --version
 ```
 
 ### 4. A domain name
 
-You need a domain name (or subdomain) to point at the load balancer. For example: `grafana.yourdomain.com`. This is required for HTTPS and for the Cognito login page to redirect back correctly after authentication.
+You need a domain or subdomain to point at the load balancer — e.g. `grafana.yourdomain.com`. This is required for HTTPS and for the Cognito login page to redirect back correctly after authentication.
 
 ---
 
 ## Step 1 — Create an ACM Certificate
 
-AWS Certificate Manager (ACM) provides free HTTPS certificates for domains you own. The certificate must be created in the **same AWS region** you are deploying to.
+ACM gives you free HTTPS certificates for domains you own. Create the certificate in the **same region** you're deploying to.
 
-1. Go to the **AWS Console** → search for **Certificate Manager** → open it
+1. Go to the AWS Console → search for **Certificate Manager** → open it
 2. Click **Request a certificate**
-3. Choose **Request a public certificate** and click Next
-4. Under **Fully qualified domain name**, enter the subdomain you plan to use, e.g. `grafana.yourdomain.com`
-5. Under **Validation method**, choose **DNS validation**
-6. Click **Request**
+3. Choose **Request a public certificate** → Next
+4. Enter your subdomain under **Fully qualified domain name**, e.g. `grafana.yourdomain.com`
+5. Pick **DNS validation** → **Request**
 
-You will be taken to the certificate detail page. Its status will be **Pending validation**.
+The certificate will land in **Pending validation**.
 
-7. Click into the certificate. Under **Domains**, you will see a **CNAME name** and a **CNAME value**
-8. Log in to your domain registrar and add a new **CNAME record** with those exact values. The process varies by registrar but all registrars support CNAME records — look for a "DNS management" or "DNS records" section
-9. Return to ACM and wait. Validation typically takes 5–30 minutes. Refresh the page until the status shows **Issued**
-10. Once issued, copy the **Certificate ARN** — it looks like `arn:aws:acm:eu-west-1:123456789012:certificate/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`. You will need this in Step 3
+6. Click into the certificate. Under **Domains** you'll see a **CNAME name** and **CNAME value**
+7. Log into your domain registrar and add a CNAME record with those exact values — look for "DNS management" or "DNS records" in your registrar's control panel
+8. Come back to ACM and wait. Validation usually takes 5–30 minutes. Refresh until the status shows **Issued**
+9. Copy the **Certificate ARN** (looks like `arn:aws:acm:eu-west-1:123456789012:certificate/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`) — you'll need it in Step 3
 
 ---
 
 ## Step 2 — Bootstrap CDK (first time only)
 
-CDK needs to provision some resources in your AWS account before it can deploy stacks. This is a one-time setup per account and region:
+CDK needs to set up some resources in your account before it can deploy anything. This is a one-off per account and region:
 
 ```bash
 cdk bootstrap aws://YOUR_ACCOUNT_ID/YOUR_REGION
 ```
 
-Replace `YOUR_ACCOUNT_ID` with your 12-digit AWS account ID (found top-right in the AWS Console) and `YOUR_REGION` with your chosen region, e.g.:
+Your account ID is the 12-digit number in the top-right of the AWS Console. For example:
 
 ```bash
 cdk bootstrap aws://123456789012/eu-west-1
@@ -97,7 +90,7 @@ From the `infrastructure/` directory:
 npm install
 ```
 
-Then deploy, supplying the three required parameters:
+Then deploy with the three required parameters:
 
 ```bash
 npx cdk deploy --all \
@@ -114,70 +107,63 @@ npx cdk deploy --all \
   --parameters ApplicationStack:OpenAiApiKey=sk-your-openai-api-key
 ```
 
-`OpenAiApiKey` is used only by the smart-metrics backend for the AI Investigator. CDK stores it in Secrets Manager and injects it into the ECS task as `OPENAI_API_KEY`; it is not exposed to Grafana or the browser.
+`OpenAiApiKey` is only used by the smart-metrics backend for the AI Investigator. CDK stores it in Secrets Manager and injects it into the ECS task as `OPENAI_API_KEY` — it never touches Grafana or the browser.
 
-The metrics ingestion API key (`MetricsApiKey`) is auto-generated by AWS on first deploy and stored in Secrets Manager. After deployment completes, retrieve it from the ARN printed in the `MetricsApiKeySecretArn` stack output (see Sending Metrics below).
+The metrics ingestion API key (`MetricsApiKey`) is auto-generated on first deploy and stored in Secrets Manager. After deployment, retrieve it from the ARN printed in the `MetricsApiKeySecretArn` stack output (see Sending Metrics below).
 
-CDK will show you a summary of the changes and ask for confirmation before creating any resources. Type `y` to proceed.
-
-Deployment takes approximately 10–15 minutes.
+CDK will show you a summary of changes before doing anything — type `y` to proceed. The whole deployment takes around 10–15 minutes.
 
 ---
 
 ## Step 4 — Point your DNS at the load balancer
 
-Once deployment completes, CDK prints the stack outputs. Look for `AlbDnsName` — it will look something like:
+Once deployment finishes, check the CDK output for `AlbDnsName`:
 
 ```
 Outputs:
-ApplicationStack.AlbDnsName = Metropolis-ALB-1234567890.eu-west-1.elb.amazonaws.com
+ApplicationStack.AlbDnsName = Trickl-ALB-1234567890.eu-west-1.elb.amazonaws.com
 ```
 
-Go back to your domain registrar's DNS management page and add a **CNAME record**:
-
-| Name | Type | Value |
-|---|---|---|
-| `grafana` (or whatever subdomain you chose) | CNAME | the ALB DNS name from above |
-
-DNS propagation usually takes a few minutes but can take up to an hour depending on your registrar.
+Head back to your registrar's DNS management page and add a CNAME.
+DNS usually propagates within a few minutes, but can take up to an hour.
 
 ---
 
 ## Step 5 — Create your first user
 
-The Cognito User Pool is configured with self-signup disabled — users must be created by an administrator.
+Self-signup is disabled on the Cognito User Pool, so users need to be created manually.
 
-1. Go to the **AWS Console** → search for **Cognito** → open it
-2. Click on **User pools** and select the pool named `UserPool` (inside the `ApplicationStack`)
+1. Go to the AWS Console → search for **Cognito** → open it
+2. Click **User pools** and select `UserPool` (inside `ApplicationStack`)
 3. Click **Create user**
-4. Enter the user's email address. Leave **Send an invitation** checked
+4. Enter the user's email. Leave **Send an invitation** checked
 5. Click **Create user**
 
-The user will receive an email from AWS Cognito with a temporary password.
+AWS Cognito will send them an email with a temporary password.
 
 ---
 
 ## Step 6 — First login
 
-1. Visit your domain in a browser, e.g. `https://grafana.yourdomain.com`
+1. Visit your domain, e.g. `https://grafana.yourdomain.com`
 2. The load balancer redirects you to the Cognito hosted login page
-3. Enter the email address and the temporary password from the invitation email
-4. Cognito will prompt you to set a new permanent password
-5. After setting the password you are redirected back to Grafana and signed in automatically — no second login prompt
+3. Enter the email and temporary password from the invitation
+4. Cognito will ask you to set a permanent password
+5. After that you're dropped straight into Grafana — no second login
 
-All future visits will use the session cookie set by the load balancer. The session lasts 7 days before requiring re-authentication.
+Sessions last 7 days before you'll need to re-authenticate.
 
 ---
 
 ## Sending metrics
 
-Metrics are pushed to Vector over HTTPS on port 9090 using the OTLP/HTTP protocol. Every request must include the `X-API-Key` header set to the auto-generated metrics API key.
+Push metrics to Vector over HTTPS on port 9090 using OTLP/HTTP. Every request needs an `X-API-Key` header set to the auto-generated metrics API key.
 
 **Endpoint:** `https://YOUR_DOMAIN:9090/v1/metrics`
 
 ### Retrieving the API key
 
-After deployment, the `MetricsApiKeySecretArn` stack output contains the Secrets Manager ARN for the key. Retrieve the value via the AWS CLI:
+The `MetricsApiKeySecretArn` stack output has the Secrets Manager ARN. Pull the value via CLI:
 
 ```bash
 aws secretsmanager get-secret-value \
@@ -186,22 +172,20 @@ aws secretsmanager get-secret-value \
   --output text
 ```
 
-Or go to **AWS Console → Secrets Manager**, find the secret by the ARN, and click **Retrieve secret value**.
+Or go to **AWS Console → Secrets Manager**, find the secret by ARN, and click **Retrieve secret value**.
 
 ### Rotating the API key
 
-1. Go to **AWS Console → Secrets Manager** → open the secret at `MetricsApiKeySecretArn`
-2. Click **Retrieve secret value** → **Edit** → enter the new key → **Save**
-3. Redeploy to sync the new value into the WAF rule:
+1. Go to **AWS Console -> Secrets Manager** -> open the secret at `MetricsApiKeySecretArn`
+2. Click **Retrieve secret value** -> **Edit** -> enter the new key -> **Save**
+3. Redeploy to push the new value into the WAF rule:
    ```bash
    npx cdk deploy ApplicationStack
    ```
-   No parameters needed — CDK re-resolves the secret automatically.
-4. Update the key in all metric senders.
+   CDK re-resolves the secret automatically — no parameters needed.
+4. Update the key wherever you're sending metrics from.
 
 ### OpenTelemetry SDK (Node.js)
-
-Configure your OTLP exporter with the endpoint and header:
 
 ```javascript
 const { OTLPMetricExporter } = require('@opentelemetry/exporter-metrics-otlp-http');
@@ -216,6 +200,4 @@ const exporter = new OTLPMetricExporter({
 
 ### Other OTLP senders
 
-Any tool that supports OTLP/HTTP (e.g. OpenTelemetry Collector, Grafana Alloy) follows the same pattern — set the OTLP endpoint to `https://YOUR_DOMAIN:9090/v1/metrics` and add `X-API-Key: YOUR_METRICS_API_KEY` as a custom header.
-
-If you need to rotate the key in future, redeploy the stack with a new `MetricsApiKey` value and update the configuration of all metric senders.
+Any tool that speaks OTLP/HTTP works the same way — set the endpoint to `https://YOUR_DOMAIN:9090/v1/metrics` and add `X-API-Key: YOUR_METRICS_API_KEY` as a custom header. This includes OpenTelemetry Collector, Grafana Alloy, and others.
